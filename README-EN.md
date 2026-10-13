@@ -68,11 +68,13 @@ Pick **"1. Установка"**, enter the bot token from [@BotFather](https://
 
 ## Bot commands
 
-**User:** `/start`, `/myconfig`, `/client`, `/direct` (a channel without a document: plain TCP to the server; only when the admin set `PUBLIC_HOST`), `/delete` (delete your own channel or withdraw your request, with a confirmation button), or just send a document link.
+**User:** `/start`, `/myconfig`, `/client`, `/direct` (a channel without a document: plain TCP to the server; only when the admin set `PUBLIC_HOST`), `/cups` (a channel without a document: Cups.online rooms created by the server), `/delete` (delete your own channel or withdraw your request, with a confirmation button), or just send a document link.
 
-**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url|direct> [secret|nosecret] [vyandex]`, `/delete [id]` (delete a channel after a button confirmation; the owner is notified), `/revoke <id>` (stop immediately), `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
+**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url|direct|cups> [secret|nosecret] [vyandex]`, `/delete [id]` (delete a channel after a button confirmation; the owner is notified), `/revoke <id>` (stop immediately), `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
 
 **Supported links:** Yandex Docs (`https://disk.yandex.ru/i/…`), Yandex Boards (`https://boards.yandex.ru/guest/?hash=…`), Mail.ru (`https://cloud.mail.ru/public/…`). Yandex Volga (`vyandex`) is handed out by the admin: `/give <tg_id> <url> vyandex`.
+
+**Cups.online (`/cups`)** needs no document: the exit creates the rooms at start and the bot puts the printed room list into the profile (`CUPS_ENABLED=0` turns it off; the server must reach `interview.cups.online`). Without `--url` the exit makes new rooms on every start, so after a container restart the old profile stops working; the bot notices the restart and sends the new profile itself.
 
 ## Clients
 
