@@ -308,14 +308,60 @@ def detect_transport(url):
     return None
 
 
-async def url_alive(url):
+# Сервисы документов (в первую очередь Mail.ru) режут запросы без браузерных заголовков,
+# поэтому проверка ссылки представляется браузером, как это делает и сам OpenFlux.
+URL_CHECK_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
+# Mail.ru отдаёт заголовки длиннее лимита aiohttp по умолчанию (8190 байт): один только
+# content-security-policy-report-only занимает около 9 КБ. Без этого aiohttp падает с
+# ClientResponseError, хотя документ открывается.
+URL_CHECK_LIMITS = {"max_line_size": 65536, "max_field_size": 65536}
+
+
+async def url_check(url):
+    """→ (ok, reason). reason: "HTTP 403" или имя ошибки сети; пусто, если всё хорошо."""
     try:
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout) as s:
+        async with aiohttp.ClientSession(timeout=timeout, headers=URL_CHECK_HEADERS, **URL_CHECK_LIMITS) as s:
             async with s.get(url, allow_redirects=True) as r:
-                return r.status < 400
-    except Exception:
-        return False
+                if r.status < 400:
+                    return True, ""
+                log.warning("url check %s -> HTTP %s", url, r.status)
+                return False, f"HTTP {r.status}"
+    except Exception as e:
+        log.warning("url check %s failed: %s: %s", url, type(e).__name__, e)
+        return False, type(e).__name__
+
+
+def url_check_message(reason):
+    """Понятное пользователю объяснение, почему проверка ссылки не прошла."""
+    if reason in ("HTTP 404", "HTTP 410"):
+        return "Документ не найден. Проверь ссылку и что файл не удалён."
+    if reason.startswith("HTTP "):
+        return (
+            f"Сервис ответил <code>{esc(reason)}</code>. Либо документ закрыт для доступа по ссылке, "
+            "либо сервис не пускает сервер бота. Проверь доступ «по ссылке» и повтори; "
+            "если так и остаётся — админ увидит причину в логах бота."
+        )
+    if reason == "ClientResponseError":
+        return (
+            "Сервис ответил так, что бот не смог разобрать ответ (например, слишком длинные заголовки). "
+            "Админ увидит подробности в логах бота."
+        )
+    return (
+        f"Сервер бота не смог подключиться к сервису (<code>{esc(reason)}</code>). "
+        "Возможно, он недоступен с адреса сервера. Админ увидит подробности в логах бота."
+    )
+
+
+async def url_alive(url):
+    return (await url_check(url))[0]
 
 
 def wants_secret(ch):
@@ -759,8 +805,9 @@ async def on_link(m: Message, bot: Bot):
         await m.answer("У тебя уже есть заявка на рассмотрении.")
         return
     await m.answer("Проверяю ссылку…")
-    if not await url_alive(url):
-        await m.answer("Документ недоступен. Проверь, что он открыт по ссылке.")
+    ok, reason = await url_check(url)
+    if not ok:
+        await m.answer(url_check_message(reason))
         return
 
     if SECRET_CHOICE == "ask":
