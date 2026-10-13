@@ -468,8 +468,13 @@ def build_template_config(ch):
     )
 
 
-def config_message(ch, head):
-    text = f"{head}\n\n<code>{esc(build_config(ch))}</code>"
+def config_link_message(ch):
+    """Ссылка/конфиг одним отдельным сообщением — ничего лишнего, чтобы её было удобно копировать и пересылать."""
+    return f"<code>{esc(build_config(ch))}</code>"
+
+
+def config_head(ch, head):
+    text = head
     # секрет всегда виден отдельно, даже если шаблон его не содержит
     if wants_secret(ch) and ch["secret"] and not secret_embedded(ch):
         text += f"\n\n🔑 Секрет: <code>{esc(ch['secret'])}</code>"
@@ -484,7 +489,7 @@ def qr_png(data):
 
 
 async def send_config(bot: Bot, ch, head, tail="", kb=None):
-    """Конфиг текстом + QR. Сначала QR, чтобы текст с кнопками оказался последним сообщением."""
+    """QR, пояснение, ссылка ОТДЕЛЬНЫМ сообщением, затем хвост с кнопками (кнопки остаются последними)."""
     if QR_ENABLED:
         try:
             await bot.send_photo(
@@ -494,7 +499,11 @@ async def send_config(bot: Bot, ch, head, tail="", kb=None):
             )
         except Exception as e:
             log.warning("QR for channel %s failed: %s", ch["id"], e)
-    await notify_user(bot, ch["tg_id"], config_message(ch, head) + tail, kb)
+    await notify_user(bot, ch["tg_id"], config_head(ch, head))
+    tail = tail.strip()
+    await notify_user(bot, ch["tg_id"], config_link_message(ch), None if tail else kb)
+    if tail:
+        await notify_user(bot, ch["tg_id"], tail, kb)
 
 
 def find_secret(logs):
