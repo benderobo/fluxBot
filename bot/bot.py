@@ -40,6 +40,7 @@ MEM_ALERT_PCT = int(os.getenv("MEM_ALERT_PCT", "90"))
 ARGS_TEMPLATES = {
     "yandex": os.getenv("ARGS_YANDEX", "--role=exit --transport=yandex --url {url}"),
     "mailru": os.getenv("ARGS_MAILRU", "--role=exit --transport=mailru --url {url}"),
+    "vyandex": os.getenv("ARGS_VYANDEX", "--role=exit --transport=vyandex --url {url}"),
 }
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без
@@ -74,6 +75,7 @@ CONFIG_NAME = os.getenv("CONFIG_NAME") or "OpenFlux {id}"  # имя профил
 TRANSPORT_TYPES = {
     "yandex": os.getenv("TYPE_YANDEX") or "yandex",
     "mailru": os.getenv("TYPE_MAILRU") or "mailru",
+    "vyandex": os.getenv("TYPE_VYANDEX") or "vyandex",
 }
 
 # отправлять конфиг ещё и QR-кодом (iOS-клиент импортирует профили через QR)
@@ -111,6 +113,16 @@ CLIENT_TEXT = (
     + '\niOS-клиент — <a href="https://github.com/saharev1">@saharev1</a> 🙏'
 )
 
+# Yandex Volga (транспорт vyandex): ссылка вида https://docs.yandex.ru/edit/d/<id>.
+# Шаблон взят из провижининга OpenFlux; такие же ссылки обычный транспорт yandex
+# тоже может получить, поэтому автоопределение выключено по умолчанию:
+#   off  — vyandex выдаётся только админом: /give <tg_id> <url> vyandex
+#   auto — ссылки /edit/d/ от пользователей сразу уходят в vyandex
+VYANDEX_URL_RE = re.compile(
+    r"^https://(?:docs|disk)\.yandex\.(?:ru|com|by|kz|uz)/edit/d/[A-Za-z0-9_-]{16,200}/?(?:[?#]\S*)?$"
+)
+VYANDEX_MODE = (os.getenv("VYANDEX_MODE") or "off").lower()
+
 URL_RULES = [
     (re.compile(r"^https://(disk|docs)\.yandex\.(ru|com)/\S+$"), "yandex"),
     (re.compile(r"^https://cloud\.mail\.ru/\S+$"), "mailru"),
@@ -119,7 +131,8 @@ URL_RULES = [
 HELP_USER = (
     "Пришли ссылку на <b>публичный</b> документ (доступ по ссылке):\n"
     "• Yandex Docs: <code>https://disk.yandex.ru/i/...</code> (старый редактор)\n"
-    "• Mail.ru: <code>https://cloud.mail.ru/public/...</code>\n\n"
+    + ("• Yandex Docs (новый редактор): <code>https://docs.yandex.ru/edit/d/...</code>\n" if VYANDEX_MODE == "auto" else "")
+    + "• Mail.ru: <code>https://cloud.mail.ru/public/...</code>\n\n"
     "В ответ придёт конфиг для OpenFlux.\n"
     "/myconfig — прислать мой конфиг ещё раз\n"
     "/client — скачать клиент"
@@ -129,7 +142,7 @@ HELP_ADMIN = (
     "/users — пользователи\n"
     "/channels — каналы\n"
     "/status — состояние сервера\n"
-    "/give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] — выдать канал\n"
+    "/give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex] — выдать канал\n"
     "/revoke &lt;channel_id&gt; — остановить канал\n"
     "/ban &lt;tg_id&gt; · /unban &lt;tg_id&gt;\n"
     "/decode &lt;openflux://v1/...&gt; — показать JSON профиля"
@@ -196,7 +209,19 @@ def esc(s):
     return html.escape(str(s if s is not None else ""))
 
 
+def clean_link(url):
+    """Без query, fragment и хвостового слеша — так ссылку нормализует и OpenFlux."""
+    return re.split(r"[?#]", url, maxsplit=1)[0].rstrip("/")
+
+
+def canonical_url(url, transport):
+    # ссылка попадает и в --url узла, и в context профиля: обе стороны берут одну строку
+    return clean_link(url) if transport == "vyandex" else url
+
+
 def detect_transport(url):
+    if VYANDEX_MODE == "auto" and VYANDEX_URL_RE.match(url):
+        return "vyandex"
     for rx, t in URL_RULES:
         if rx.match(url):
             return t
@@ -647,6 +672,7 @@ async def on_link(m: Message, bot: Bot):
     if not transport:
         await m.answer("Не узнаю ссылку.\n\n" + HELP_USER)
         return
+    url = canonical_url(url, transport)
     # незавершённый выбор секрета заменяется новой ссылкой
     ex("UPDATE channels SET status='cancelled' WHERE tg_id=? AND status='choosing'", u["tg_id"])
     if q1("SELECT id FROM channels WHERE tg_id=? AND status='pending'", u["tg_id"]):
@@ -796,29 +822,54 @@ async def cmd_channels(m: Message):
     await m.answer(f"Запущено: {total}/{MAX_CHANNELS}\n\n" + ("\n".join(lines) or "Нет активных"))
 
 
+GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex]"
+
+
+def parse_give(args):
+    """/give <tg_id> <url> [secret|nosecret] [vyandex] → ((tg_id, url, use_secret, transport), None) или (None, ошибка)."""
+    parts = (args or "").split()
+    flags = parts[2:]
+    allowed = {"secret", "nosecret", "vyandex"}
+    if (
+        len(parts) < 2 or not parts[0].isdigit()
+        or any(f not in allowed for f in flags) or len(set(flags)) != len(flags)
+        or {"secret", "nosecret"} <= set(flags)
+    ):
+        return None, GIVE_USAGE
+    url = parts[1]
+    if {"secret", "nosecret"} & set(flags):
+        use_secret = "secret" in flags
+    else:
+        use_secret = SECRET_DEFAULT
+    if "vyandex" in flags:
+        if not VYANDEX_URL_RE.match(url):
+            return None, "Для vyandex нужна ссылка вида https://docs.yandex.ru/edit/d/…"
+        transport = "vyandex"
+    else:
+        transport = detect_transport(url)
+        if not transport:
+            return None, "Не узнаю ссылку."
+    return (int(parts[0]), canonical_url(url, transport), use_secret, transport), None
+
+
 @router.message(Command("give"))
 async def cmd_give(m: Message, command: CommandObject, bot: Bot):
     if not is_admin(m.from_user.id):
         return
-    parts = (command.args or "").split()
-    if len(parts) not in (2, 3) or not parts[0].isdigit() or (len(parts) == 3 and parts[2] not in ("secret", "nosecret")):
-        await m.answer("Формат: /give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret]")
+    parsed, error = parse_give(command.args)
+    if error:
+        await m.answer(error)
         return
-    tg_id, url = int(parts[0]), parts[1]
-    use_secret = (parts[2] == "secret") if len(parts) == 3 else SECRET_DEFAULT
+    tg_id, url, use_secret, transport = parsed
     if not q1("SELECT tg_id FROM users WHERE tg_id=?", tg_id):
         await m.answer("Пользователь должен сначала написать боту /start.")
-        return
-    transport = detect_transport(url)
-    if not transport:
-        await m.answer("Не узнаю ссылку.")
         return
     ex("UPDATE users SET status='approved' WHERE tg_id=?", tg_id)
     ch_id = ex(
         "INSERT INTO channels(tg_id, transport, url, status, created, use_secret) VALUES(?,?,?,'pending',?,?)",
         tg_id, transport, url, int(time.time()), int(use_secret),
     )
-    await m.answer(f"Запускаю канал #{ch_id} {'🔑' if use_secret else '🔓'}…")
+    await m.answer(f"Запускаю канал #{ch_id} {'🔑' if use_secret else '🔓'} ({transport})…")
     asyncio.create_task(provision(bot, ch_id))
 
 
