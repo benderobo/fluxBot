@@ -68,9 +68,9 @@ Pick **"1. Установка"**, enter the bot token from [@BotFather](https://
 
 ## Bot commands
 
-**User:** `/start`, `/myconfig`, `/client`, or just send a document link.
+**User:** `/start`, `/myconfig`, `/client`, `/delete` (delete your own channel or withdraw your request, with a confirmation button), or just send a document link.
 
-**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url> [secret|nosecret] [vyandex]`, `/revoke <id>`, `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
+**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url> [secret|nosecret] [vyandex]`, `/delete [id]` (delete a channel after a button confirmation; the owner is notified), `/revoke <id>` (stop immediately), `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
 
 ## Clients
 
