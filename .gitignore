@@ -1,0 +1,34 @@
+# secrets — never commit
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+cookies*.json
+cookies*.txt
+secret*.txt
+
+# runtime state and backups
+bot/data/
+*.db
+*.sqlite
+ofbot-backup-*.tar.gz
+
+# downloaded/built OpenFlux binary and artifacts
+exit/universal-bypass-tool
+*.exe
+
+# spreadsheets (often hold credentials)
+*.xlsx
+*.xls
+*.xlsm
+*.csv
+
+# python / editors / OS
+__pycache__/
+*.pyc
+.venv/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
