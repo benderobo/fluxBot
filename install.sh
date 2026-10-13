@@ -121,6 +121,7 @@ ARGS_TEMPLATES = {
     "yandex": os.getenv("ARGS_YANDEX", "--role=exit --transport=yandex --url {url}"),
     "mailru": os.getenv("ARGS_MAILRU", "--role=exit --transport=mailru --url {url}"),
     "vyandex": os.getenv("ARGS_VYANDEX", "--role=exit --transport=vyandex --url {url}"),
+    "boards": os.getenv("ARGS_BOARDS", "--role=exit --transport=boards --url {url}"),
 }
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без
@@ -156,6 +157,7 @@ TRANSPORT_TYPES = {
     "yandex": os.getenv("TYPE_YANDEX") or "yandex",
     "mailru": os.getenv("TYPE_MAILRU") or "mailru",
     "vyandex": os.getenv("TYPE_VYANDEX") or "vyandex",
+    "boards": os.getenv("TYPE_BOARDS") or "boards",
 }
 
 # отправлять конфиг ещё и QR-кодом (iOS-клиент импортирует профили через QR)
@@ -203,7 +205,9 @@ VYANDEX_URL_RE = re.compile(
 )
 VYANDEX_MODE = (os.getenv("VYANDEX_MODE") or "off").lower()
 
+# Yandex Boards: транспорт берёт из ссылки только параметр hash (так же делает extractBoardsHash в OpenFlux)
 URL_RULES = [
+    (re.compile(r"^https://boards\.yandex\.ru/[^\s#]*[?&]hash=[^&\s#]{6,}[^\s#]*(?:#\S*)?$"), "boards"),
     (re.compile(r"^https://(disk|docs)\.yandex\.(ru|com)/\S+$"), "yandex"),
     (re.compile(r"^https://cloud\.mail\.ru/\S+$"), "mailru"),
 ]
@@ -212,6 +216,7 @@ HELP_USER = (
     "Пришли ссылку на <b>публичный</b> документ (доступ по ссылке):\n"
     "• Yandex Docs: <code>https://disk.yandex.ru/i/...</code> (старый редактор)\n"
     + ("• Yandex Docs (новый редактор): <code>https://docs.yandex.ru/edit/d/...</code>\n" if VYANDEX_MODE == "auto" else "")
+    + "• Yandex Boards: <code>https://boards.yandex.ru/guest/?hash=...</code>\n"
     + "• Mail.ru: <code>https://cloud.mail.ru/public/...</code>\n\n"
     "В ответ придёт конфиг для OpenFlux.\n"
     "/myconfig — прислать мой конфиг ещё раз\n"
@@ -298,7 +303,11 @@ def clean_link(url):
 
 def canonical_url(url, transport):
     # ссылка попадает и в --url узла, и в context профиля: обе стороны берут одну строку
-    return clean_link(url) if transport == "vyandex" else url
+    if transport == "vyandex":
+        return clean_link(url)
+    if transport == "boards":
+        return url.split("#", 1)[0]  # query нужен (там hash), фрагмент — нет
+    return url
 
 
 def detect_transport(url):
@@ -360,6 +369,21 @@ def url_check_message(reason):
         f"Сервер бота не смог подключиться к сервису (<code>{esc(reason)}</code>). "
         "Возможно, он недоступен с адреса сервера. Админ увидит подробности в логах бота."
     )
+
+
+# Для этих сервисов проверка ссылки не подтверждена на практике: ответ 4xx/5xx (кроме 404/410) не блокирует
+# выдачу канала, а только пишется в лог. Недоступный документ всё равно виден по логам узла.
+SOFT_CHECK_TRANSPORTS = {"boards"}
+
+
+def check_blocks(transport, ok, reason):
+    """Нужно ли отказать пользователю по результату проверки ссылки."""
+    if ok:
+        return False
+    if transport in SOFT_CHECK_TRANSPORTS and reason.startswith("HTTP ") and reason not in ("HTTP 404", "HTTP 410"):
+        log.warning("link check for %s answered %s, continuing anyway", transport, reason)
+        return False
+    return True
 
 
 async def url_alive(url):
@@ -827,7 +851,7 @@ async def on_link(m: Message, bot: Bot):
         return
     await m.answer("Проверяю ссылку…")
     ok, reason = await url_check(url)
-    if not ok:
+    if check_blocks(transport, ok, reason):
         await m.answer(url_check_message(reason))
         return
 
@@ -1378,6 +1402,7 @@ configure() {
     echo "ARGS_YANDEX=$(env_or ARGS_YANDEX '--role=exit --transport=yandex --url {url}')"
     echo "ARGS_MAILRU=$(env_or ARGS_MAILRU '--role=exit --transport=mailru --url {url}')"
     echo "ARGS_VYANDEX=$(env_or ARGS_VYANDEX '--role=exit --transport=vyandex --url {url}')"
+    echo "ARGS_BOARDS=$(env_or ARGS_BOARDS '--role=exit --transport=boards --url {url}')"
     echo "CLIENT_LINKS=$(env_get CLIENT_LINKS)"
     local legacy; legacy=$(env_get SECRET_MODE)
     echo "SECRET_CHOICE=$(env_or SECRET_CHOICE "$([ "$legacy" = none ] && echo never || echo ask)")"
@@ -1394,6 +1419,7 @@ configure() {
     echo "TYPE_YANDEX=$(env_or TYPE_YANDEX yandex)"
     echo "TYPE_MAILRU=$(env_or TYPE_MAILRU mailru)"
     echo "TYPE_VYANDEX=$(env_or TYPE_VYANDEX vyandex)"
+    echo "TYPE_BOARDS=$(env_or TYPE_BOARDS boards)"
     echo "VYANDEX_MODE=$(env_or VYANDEX_MODE off)"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
