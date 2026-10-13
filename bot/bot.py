@@ -42,7 +42,16 @@ ARGS_TEMPLATES = {
     "mailru": os.getenv("ARGS_MAILRU", "--role=exit --transport=mailru --url {url}"),
     "vyandex": os.getenv("ARGS_VYANDEX", "--role=exit --transport=vyandex --url {url}"),
     "boards": os.getenv("ARGS_BOARDS", "--role=exit --transport=boards --url {url}"),
+    # прямой TCP: узел слушает порт, который бот публикует наружу (см. PUBLIC_HOST)
+    "direct": os.getenv("ARGS_DIRECT", "--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}"),
 }
+# Прямое TCP-подключение к серверу (без документа). Включается, только если задан PUBLIC_HOST — публичный адрес сервера.
+# Адрес узла в этом режиме виден, поэтому он не маскируется; ключ шифрования обязателен.
+PUBLIC_HOST = (os.getenv("PUBLIC_HOST") or "").strip()
+DIRECT_PORT_MIN = int(os.getenv("DIRECT_PORT_MIN") or "20000")
+DIRECT_PORT_MAX = int(os.getenv("DIRECT_PORT_MAX") or "20999")
+DIRECT_CONTEXT = "http://#"  # контекст ключа узла без --url (проверено официальным --make-link и узлом)
+DIRECT_PRIORITY = 50  # как directPriority в OpenFlux
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без
 # SECRET_METHOD: как получить секрет для каналов «с секретом»:
@@ -125,6 +134,10 @@ VYANDEX_URL_RE = re.compile(
 )
 VYANDEX_MODE = (os.getenv("VYANDEX_MODE") or "off").lower()
 
+def direct_enabled():
+    return bool(PUBLIC_HOST) and CONFIG_FORMAT == "openflux-v1"
+
+
 # Yandex Boards: транспорт берёт из ссылки только параметр hash (так же делает extractBoardsHash в OpenFlux)
 URL_RULES = [
     (re.compile(r"^https://boards\.yandex\.ru/[^\s#]*[?&]hash=[^&\s#]{6,}[^\s#]*(?:#\S*)?$"), "boards"),
@@ -142,13 +155,14 @@ HELP_USER = (
     "/myconfig — прислать мой конфиг ещё раз\n"
     "/client — скачать клиент\n"
     "/delete — удалить мой канал"
+    + ("\n/direct — канал без документа: прямое TCP-подключение (адрес сервера виден)" if direct_enabled() else "")
 )
 HELP_ADMIN = (
     "<b>Админ</b>\n"
     "/users — пользователи\n"
     "/channels — каналы\n"
     "/status — состояние сервера\n"
-    "/give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex] — выдать канал\n"
+    "/give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex] — выдать канал\n"
     "/delete [channel_id] — удалить канал (с подтверждением; без номера — свои)\n"
     "/revoke &lt;channel_id&gt; — остановить канал сразу, без подтверждения\n"
     "/ban &lt;tg_id&gt; · /unban &lt;tg_id&gt;\n"
@@ -186,6 +200,8 @@ def init_db():
             c.execute("ALTER TABLE channels ADD COLUMN started_at TEXT")
         if "use_secret" not in cols:
             c.execute("ALTER TABLE channels ADD COLUMN use_secret INTEGER")
+        if "port" not in cols:
+            c.execute("ALTER TABLE channels ADD COLUMN port INTEGER")
 
 
 def q(sql, *args):
@@ -345,6 +361,11 @@ def build_config(ch):
     if CONFIG_FORMAT == "openflux-v1":
         name = CONFIG_NAME.format(id=ch["id"], tg_id=ch["tg_id"], transport=ch["transport"])
         obj = {"name": name}
+        if ch["transport"] == "direct":
+            # сессия с проверкой участников: ключ обязателен, context — по умолчанию узла без --url
+            obj.update(negotiate=True, secret=ch["secret"], context=DIRECT_CONTEXT)
+            obj["transports"] = [{"type": "direct", "dial": ch["url"], "priority": DIRECT_PRIORITY}]
+            return encode_openflux_v1(obj)
         if wants_secret(ch) and ch["secret"]:
             # AES-256-GCM: ключ выводится из секрета и ссылки на документ (context),
             # поэтому context обязан совпадать с --url канала до символа
@@ -454,10 +475,11 @@ def _run_container(ch, secret=None):
     toks = shlex.split(tpl)
     if not secret:
         toks = strip_secret_tokens(toks)
-    fmt = {"url": ch["url"], "secret": secret or ""}
+    fmt = {"url": ch["url"], "secret": secret or "", "port": ch["port"]}
     args = [t.format(**fmt) for t in toks]
     env = {}
-    if secret and SECRET_METHOD == "generate" and "{secret}" not in tpl:
+    direct = ch["transport"] == "direct"
+    if secret and (SECRET_METHOD == "generate" or direct) and "{secret}" not in tpl:
         if SECRET_ARG:
             args += [t.format(**fmt) for t in shlex.split(SECRET_ARG)]
         else:
@@ -476,6 +498,7 @@ def _run_container(ch, secret=None):
             type="json-file", config={"max-size": "10m", "max-file": "2"}
         ),
         labels={"openflux.bot": "1", "openflux.channel": str(ch["id"])},
+        ports={f"{ch['port']}/tcp": ch["port"]} if direct else None,
     )
     return name
 
@@ -524,6 +547,16 @@ def _remove_container(name):
         pass
 
 
+def allocate_port(ch_id):
+    """Свободный порт из диапазона для прямого канала; сохраняет его и адрес host:port в записи. None, если порты кончились."""
+    used = {r["port"] for r in q("SELECT port FROM channels WHERE port IS NOT NULL AND status IN ('running','pending')")}
+    for p in range(DIRECT_PORT_MIN, DIRECT_PORT_MAX + 1):
+        if p not in used:
+            ex("UPDATE channels SET port=?, url=? WHERE id=?", p, f"{PUBLIC_HOST}:{p}", ch_id)
+            return p
+    return None
+
+
 async def stop_channel(ch):
     await asyncio.to_thread(_remove_container, ch["container"])
     set_channel(ch["id"], "stopped")
@@ -555,8 +588,15 @@ async def provision(bot: Bot, ch_id):
             await notify_admins(bot, f"⚠️ Лимит каналов ({MAX_CHANNELS}) исчерпан, заявка #{ch_id} не запущена.")
             return
 
+        if ch["transport"] == "direct":
+            if not PUBLIC_HOST or allocate_port(ch_id) is None:
+                set_channel(ch_id, "failed")
+                await notify_user(bot, ch["tg_id"], "Сейчас нельзя выдать прямой канал, попробуй позже.")
+                await notify_admins(bot, f"⚠️ Прямой канал #{ch_id}: нет PUBLIC_HOST или свободных портов {DIRECT_PORT_MIN}-{DIRECT_PORT_MAX}.")
+                return
+            ch = q1("SELECT * FROM channels WHERE id=?", ch_id)
         use_secret = wants_secret(ch)
-        secret = secrets.token_urlsafe(24) if use_secret and SECRET_METHOD == "generate" else None
+        secret = secrets.token_urlsafe(24) if use_secret and (SECRET_METHOD == "generate" or ch["transport"] == "direct") else None
         name = await asyncio.to_thread(_run_container, ch, secret)
         ex("UPDATE channels SET container=? WHERE id=?", name, ch_id)
         await asyncio.sleep(STARTUP_WAIT)
@@ -567,7 +607,7 @@ async def provision(bot: Bot, ch_id):
             await asyncio.to_thread(_remove_container, name)
             return
 
-        if status == "running" and use_secret and SECRET_METHOD == "log":
+        if status == "running" and use_secret and SECRET_METHOD == "log" and ch["transport"] != "direct":
             secret, logs = await wait_secret(name)
             if not secret:
                 await asyncio.to_thread(_remove_container, name)
@@ -917,12 +957,17 @@ async def cmd_channels(m: Message):
     )
 
 
-GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex]"
+GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex]"
 
 
 def parse_give(args):
     """/give <tg_id> <url> [secret|nosecret] [vyandex] → ((tg_id, url, use_secret, transport), None) или (None, ошибка)."""
     parts = (args or "").split()
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].lower() == "direct":
+        # прямой канал: ссылки нет, ключ обязателен (nosecret недопустим)
+        if any(f != "secret" for f in parts[2:]) or len(parts) > 3:
+            return None, GIVE_USAGE
+        return (int(parts[0]), "direct", True, "direct"), None
     flags = parts[2:]
     allowed = {"secret", "nosecret", "vyandex"}
     if (
@@ -956,6 +1001,9 @@ async def cmd_give(m: Message, command: CommandObject, bot: Bot):
         await m.answer(error)
         return
     tg_id, url, use_secret, transport = parsed
+    if transport == "direct" and not direct_enabled():
+        await m.answer("Прямой канал выключен: задай PUBLIC_HOST в .env и перезапусти бота.")
+        return
     if not q1("SELECT tg_id FROM users WHERE tg_id=?", tg_id):
         await m.answer("Пользователь должен сначала написать боту /start.")
         return
@@ -980,6 +1028,30 @@ async def cmd_revoke(m: Message, command: CommandObject, bot: Bot):
     await delete_channel(ch)
     await notify_user(bot, ch["tg_id"], "Твой канал остановлен администратором.")
     await m.answer(f"Канал #{ch['id']} остановлен.")
+
+
+# ---------- прямой TCP ----------
+@router.message(Command("direct"))
+async def cmd_direct(m: Message, bot: Bot):
+    u = upsert_user(m)
+    if u["status"] == "banned":
+        return
+    if not direct_enabled():
+        await m.answer("Прямое подключение на этом сервере не включено.")
+        return
+    ex("UPDATE channels SET status='cancelled' WHERE tg_id=? AND status='choosing'", u["tg_id"])
+    if q1("SELECT id FROM channels WHERE tg_id=? AND status='pending'", u["tg_id"]):
+        await m.answer("У тебя уже есть заявка на рассмотрении.")
+        return
+    await m.answer(
+        "⚠️ Прямой канал не маскируется под документ: адрес сервера виден, и его могут заблокировать. "
+        "Трафик зашифрован ключом, который придёт в профиле."
+    )
+    ch_id = ex(
+        "INSERT INTO channels(tg_id, transport, url, status, created, use_secret) VALUES(?,?,?,'pending',?,1)",
+        u["tg_id"], "direct", "direct", int(time.time()),
+    )
+    await submit_channel(bot, ch_id)
 
 
 # ---------- удаление каналов ----------
