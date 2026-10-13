@@ -38,8 +38,8 @@ STARTUP_WAIT = int(os.getenv("STARTUP_WAIT", "10"))
 DISK_ALERT_PCT = int(os.getenv("DISK_ALERT_PCT", "85"))
 MEM_ALERT_PCT = int(os.getenv("MEM_ALERT_PCT", "90"))
 ARGS_TEMPLATES = {
-    "yandex": os.getenv("ARGS_YANDEX", "--exit-node --url {url}"),
-    "mailru": os.getenv("ARGS_MAILRU", "--exit-node --transport mailru --url {url}"),
+    "yandex": os.getenv("ARGS_YANDEX", "--role=exit --transport=yandex --url {url}"),
+    "mailru": os.getenv("ARGS_MAILRU", "--role=exit --transport=mailru --url {url}"),
 }
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без

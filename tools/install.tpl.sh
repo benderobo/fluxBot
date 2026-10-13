@@ -225,8 +225,8 @@ configure() {
     echo "STARTUP_WAIT=$(env_or STARTUP_WAIT 10)"
     echo "DISK_ALERT_PCT=$(env_or DISK_ALERT_PCT 85)"
     echo "MEM_ALERT_PCT=$(env_or MEM_ALERT_PCT 90)"
-    echo "ARGS_YANDEX=$(env_or ARGS_YANDEX '--exit-node --url {url}')"
-    echo "ARGS_MAILRU=$(env_or ARGS_MAILRU '--exit-node --transport mailru --url {url}')"
+    echo "ARGS_YANDEX=$(env_or ARGS_YANDEX '--role=exit --transport=yandex --url {url}')"
+    echo "ARGS_MAILRU=$(env_or ARGS_MAILRU '--role=exit --transport=mailru --url {url}')"
     echo "CLIENT_LINKS=$(env_get CLIENT_LINKS)"
     local legacy; legacy=$(env_get SECRET_MODE)
     echo "SECRET_CHOICE=$(env_or SECRET_CHOICE "$([ "$legacy" = none ] && echo never || echo ask)")"
