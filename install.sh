@@ -124,6 +124,8 @@ ARGS_TEMPLATES = {
     "boards": os.getenv("ARGS_BOARDS", "--role=exit --transport=boards --url {url}"),
     # прямой TCP: узел слушает порт, который бот публикует наружу (см. PUBLIC_HOST)
     "direct": os.getenv("ARGS_DIRECT", "--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}"),
+    # Cups.online: узел сам создаёт комнаты при старте (без --url) и печатает их список для клиента
+    "cups": os.getenv("ARGS_CUPS", "--role=exit --transport=cupsonline"),
 }
 # Прямое TCP-подключение к серверу (без документа). Включается, только если задан PUBLIC_HOST — публичный адрес сервера.
 # Адрес узла в этом режиме виден, поэтому он не маскируется; ключ шифрования обязателен.
@@ -132,6 +134,12 @@ DIRECT_PORT_MIN = int(os.getenv("DIRECT_PORT_MIN") or "20000")
 DIRECT_PORT_MAX = int(os.getenv("DIRECT_PORT_MAX") or "20999")
 DIRECT_CONTEXT = "http://#"  # контекст ключа узла без --url (проверено официальным --make-link и узлом)
 DIRECT_PRIORITY = 50  # как directPriority в OpenFlux
+# Cups.online: канал без документа, комнаты создаёт сам узел. Контекст ключа у такого узла — "http://#"
+# (список комнат в контекст не входит, см. transport/kdfcontext.go в OpenFlux).
+CUPS_ENABLED = (os.getenv("CUPS_ENABLED") or "1") == "1"
+CUPS_TIMEOUT = int(os.getenv("CUPS_TIMEOUT") or "90")  # сколько ждать список комнат в логе узла
+# каналы без ссылки на документ: ключ обязателен и передаётся через OF_SECRET, а не из лога
+NO_DOC_TRANSPORTS = ("direct", "cups")
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без
 # SECRET_METHOD: как получить секрет для каналов «с секретом»:
@@ -167,6 +175,7 @@ TRANSPORT_TYPES = {
     "mailru": os.getenv("TYPE_MAILRU") or "mailru",
     "vyandex": os.getenv("TYPE_VYANDEX") or "vyandex",
     "boards": os.getenv("TYPE_BOARDS") or "boards",
+    "cups": os.getenv("TYPE_CUPS") or "cupsonline",
 }
 
 # отправлять конфиг ещё и QR-кодом (iOS-клиент импортирует профили через QR)
@@ -218,6 +227,10 @@ def direct_enabled():
     return bool(PUBLIC_HOST) and CONFIG_FORMAT == "openflux-v1"
 
 
+def cups_enabled():
+    return CUPS_ENABLED
+
+
 # Yandex Boards: транспорт берёт из ссылки только параметр hash (так же делает extractBoardsHash в OpenFlux)
 URL_RULES = [
     (re.compile(r"^https://boards\.yandex\.ru/[^\s#]*[?&]hash=[^&\s#]{6,}[^\s#]*(?:#\S*)?$"), "boards"),
@@ -236,13 +249,14 @@ HELP_USER = (
     "/client — скачать клиент\n"
     "/delete — удалить мой канал"
     + ("\n/direct — канал без документа: прямое TCP-подключение (адрес сервера виден)" if direct_enabled() else "")
+    + ("\n/cups — канал без документа: комнаты Cups.online" if cups_enabled() else "")
 )
 HELP_ADMIN = (
     "<b>Админ</b>\n"
     "/users — пользователи\n"
     "/channels — каналы\n"
     "/status — состояние сервера\n"
-    "/give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex] — выдать канал\n"
+    "/give &lt;tg_id&gt; &lt;url|direct|cups&gt; [secret|nosecret] [vyandex] — выдать канал\n"
     "/delete [channel_id] — удалить канал (с подтверждением; без номера — свои)\n"
     "/revoke &lt;channel_id&gt; — остановить канал сразу, без подтверждения\n"
     "/ban &lt;tg_id&gt; · /unban &lt;tg_id&gt;\n"
@@ -446,6 +460,11 @@ def build_config(ch):
             obj.update(negotiate=True, secret=ch["secret"], context=DIRECT_CONTEXT)
             obj["transports"] = [{"type": "direct", "dial": ch["url"], "priority": DIRECT_PRIORITY}]
             return encode_openflux_v1(obj)
+        if ch["transport"] == "cups":
+            # комнаты создал узел; ключ выводится из секрета и контекста "http://#" (не из списка комнат)
+            obj.update(secret=ch["secret"], context=DIRECT_CONTEXT)
+            obj["transports"] = [{"type": TRANSPORT_TYPES["cups"], "url": ch["url"]}]
+            return encode_openflux_v1(obj)
         if wants_secret(ch) and ch["secret"]:
             # AES-256-GCM: ключ выводится из секрета и ссылки на документ (context),
             # поэтому context обязан совпадать с --url канала до символа
@@ -514,6 +533,22 @@ def find_secret(logs):
     return last if isinstance(last, str) else next((g for g in last if g), None)
 
 
+# узел Cups.online при старте создаёт комнаты и печатает их одной строкой base64url(JSON-список uuid)
+CUPS_ROOMS_RE = re.compile(r"=== COPY THIS TO CLIENT ===\s*\r?\n\s*([A-Za-z0-9_-]{8,4096})\s*\r?\n\s*=+")
+
+
+def find_cups_rooms(logs):
+    """Последний напечатанный узлом список комнат или None. Проверяет, что внутри JSON-список uuid."""
+    for packed in reversed(CUPS_ROOMS_RE.findall(logs or "")):
+        try:
+            ids = json.loads(base64.urlsafe_b64decode(packed + "=" * (-len(packed) % 4)))
+        except Exception:
+            continue
+        if isinstance(ids, list) and ids and all(isinstance(i, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", i) for i in ids):
+            return packed
+    return None
+
+
 def upsert_user(m: Message):
     u = m.from_user
     ex(
@@ -568,7 +603,7 @@ def _run_container(ch, secret=None):
     args = [t.format(**fmt) for t in toks]
     env = {}
     direct = ch["transport"] == "direct"
-    if secret and (SECRET_METHOD == "generate" or direct) and "{secret}" not in tpl:
+    if secret and (SECRET_METHOD == "generate" or ch["transport"] in NO_DOC_TRANSPORTS) and "{secret}" not in tpl:
         if SECRET_ARG:
             args += [t.format(**fmt) for t in shlex.split(SECRET_ARG)]
         else:
@@ -610,6 +645,20 @@ async def wait_secret(name):
         secret = find_secret(logs)
         if secret:
             return secret, logs
+        if status != "running":
+            return None, logs
+        await asyncio.sleep(3)
+    return None, logs
+
+
+async def wait_cups_rooms(name):
+    deadline = time.monotonic() + CUPS_TIMEOUT
+    logs = ""
+    while time.monotonic() < deadline:
+        status, logs, _ = await asyncio.to_thread(_container_state, name, 300)
+        rooms = find_cups_rooms(logs)
+        if rooms:
+            return rooms, logs
         if status != "running":
             return None, logs
         await asyncio.sleep(3)
@@ -739,7 +788,7 @@ async def provision(bot: Bot, ch_id):
                 return
             ch = q1("SELECT * FROM channels WHERE id=?", ch_id)
         use_secret = wants_secret(ch)
-        secret = secrets.token_urlsafe(24) if use_secret and (SECRET_METHOD == "generate" or ch["transport"] == "direct") else None
+        secret = secrets.token_urlsafe(24) if use_secret and (SECRET_METHOD == "generate" or ch["transport"] in NO_DOC_TRANSPORTS) else None
         name = await asyncio.to_thread(_run_container, ch, secret)
         ex("UPDATE channels SET container=? WHERE id=?", name, ch_id)
         await asyncio.sleep(STARTUP_WAIT)
@@ -750,7 +799,22 @@ async def provision(bot: Bot, ch_id):
             await asyncio.to_thread(_remove_container, name)
             return
 
-        if status == "running" and use_secret and SECRET_METHOD == "log" and ch["transport"] != "direct":
+        if status == "running" and ch["transport"] == "cups":
+            rooms, logs = await wait_cups_rooms(name)
+            if not rooms:
+                await asyncio.to_thread(_remove_container, name)
+                set_channel(ch_id, "failed")
+                await notify_user(bot, ch["tg_id"], "Не удалось создать комнаты Cups.online. Админ уже разбирается.")
+                await notify_admins(
+                    bot,
+                    f"❌ Канал #{ch_id} (cups): список комнат не появился в логе за {CUPS_TIMEOUT}с "
+                    "(проверь, что сервер открывает interview.cups.online). Хвост лога:\n"
+                    f"<pre>{esc(logs[-1500:])}</pre>",
+                )
+                return
+            ex("UPDATE channels SET url=? WHERE id=?", rooms, ch_id)
+            ch = q1("SELECT * FROM channels WHERE id=?", ch_id)
+        if status == "running" and use_secret and SECRET_METHOD == "log" and ch["transport"] not in NO_DOC_TRANSPORTS:
             secret, logs = await wait_secret(name)
             if not secret:
                 await asyncio.to_thread(_remove_container, name)
@@ -846,6 +910,30 @@ async def check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carr
         await notify_admins(bot, f"✅ Канал #{ch['id']}: связь с документом восстановилась")
 
 
+async def refresh_after_restart(bot: Bot, ch, logs, started_at):
+    """Контейнер перезапускался (краш, ребут, обновление OpenFlux): подхватить новый секрет или новые комнаты Cups.online."""
+    if ch["transport"] == "cups":
+        # без --url узел при каждом старте создаёт новые комнаты, старая строка в профиле перестаёт работать
+        rooms = find_cups_rooms(logs)
+        if not rooms:
+            return  # список ещё не напечатан — проверим через минуту
+        ex("UPDATE channels SET url=?, started_at=? WHERE id=?", rooms, started_at, ch["id"])
+        if rooms != ch["url"]:
+            ch = q1("SELECT * FROM channels WHERE id=?", ch["id"])
+            await send_config(bot, ch, "🔄 Канал перезапустился и создал новые комнаты Cups.online. Старый профиль больше не работает, импортируй новый:")
+            await notify_admins(bot, f"🔄 Канал #{ch['id']} (cups): комнаты обновлены и отправлены пользователю")
+        return
+    from_log = wants_secret(ch) and SECRET_METHOD == "log"
+    new_secret = find_secret(logs) if from_log else ch["secret"]
+    if from_log and not new_secret:
+        return  # секрет ещё не напечатан — проверим через минуту
+    ex("UPDATE channels SET secret=?, started_at=? WHERE id=?", new_secret, started_at, ch["id"])
+    if new_secret != ch["secret"]:
+        ch = q1("SELECT * FROM channels WHERE id=?", ch["id"])
+        await send_config(bot, ch, "🔄 Канал перезапустился и сменил секрет. Новый конфиг:")
+        await notify_admins(bot, f"🔄 Канал #{ch['id']}: секрет обновлён и отправлен пользователю")
+
+
 async def watchdog(bot: Bot):
     alerted = {"disk": False, "mem": False}
     captcha_alerted = set()  # id каналов, по которым уже предупредили
@@ -869,16 +957,7 @@ async def watchdog(bot: Bot):
                 last_minute = await asyncio.to_thread(_recent_logs, ch["container"], 60)
                 await check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier)
                 if started_at and started_at != ch["started_at"]:
-                    # контейнер перезапускался (краш, ребут, обновление OpenFlux)
-                    from_log = wants_secret(ch) and SECRET_METHOD == "log"
-                    new_secret = find_secret(logs) if from_log else ch["secret"]
-                    if from_log and not new_secret:
-                        continue  # секрет ещё не напечатан — проверим через минуту
-                    ex("UPDATE channels SET secret=?, started_at=? WHERE id=?", new_secret, started_at, ch["id"])
-                    if new_secret != ch["secret"]:
-                        ch = q1("SELECT * FROM channels WHERE id=?", ch["id"])
-                        await send_config(bot, ch, "🔄 Канал перезапустился и сменил секрет. Новый конфиг:")
-                        await notify_admins(bot, f"🔄 Канал #{ch['id']}: секрет обновлён и отправлен пользователю")
+                    await refresh_after_restart(bot, ch, logs, started_at)
 
             st = host_stats()
             for key, pct, limit in (("disk", st["disk_pct"], DISK_ALERT_PCT), ("mem", st["mem_pct"], MEM_ALERT_PCT)):
@@ -1126,17 +1205,18 @@ async def cmd_channels(m: Message):
     )
 
 
-GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex]"
+GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url|direct|cups&gt; [secret|nosecret] [vyandex]"
 
 
 def parse_give(args):
     """/give <tg_id> <url> [secret|nosecret] [vyandex] → ((tg_id, url, use_secret, transport), None) или (None, ошибка)."""
     parts = (args or "").split()
-    if len(parts) >= 2 and parts[0].isdigit() and parts[1].lower() == "direct":
-        # прямой канал: ссылки нет, ключ обязателен (nosecret недопустим)
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].lower() in NO_DOC_TRANSPORTS:
+        # канал без ссылки (direct, cups): ключ обязателен (nosecret недопустим)
         if any(f != "secret" for f in parts[2:]) or len(parts) > 3:
             return None, GIVE_USAGE
-        return (int(parts[0]), "direct", True, "direct"), None
+        kind = parts[1].lower()
+        return (int(parts[0]), kind, True, kind), None
     flags = parts[2:]
     allowed = {"secret", "nosecret", "vyandex"}
     if (
@@ -1172,6 +1252,9 @@ async def cmd_give(m: Message, command: CommandObject, bot: Bot):
     tg_id, url, use_secret, transport = parsed
     if transport == "direct" and not direct_enabled():
         await m.answer("Прямой канал выключен: задай PUBLIC_HOST в .env и перезапусти бота.")
+        return
+    if transport == "cups" and not cups_enabled():
+        await m.answer("Канал Cups.online выключен: CUPS_ENABLED=0 в .env.")
         return
     if not q1("SELECT tg_id FROM users WHERE tg_id=?", tg_id):
         await m.answer("Пользователь должен сначала написать боту /start.")
@@ -1219,6 +1302,30 @@ async def cmd_direct(m: Message, bot: Bot):
     ch_id = ex(
         "INSERT INTO channels(tg_id, transport, url, status, created, use_secret) VALUES(?,?,?,'pending',?,1)",
         u["tg_id"], "direct", "direct", int(time.time()),
+    )
+    await submit_channel(bot, ch_id)
+
+
+@router.message(Command("cups"))
+async def cmd_cups(m: Message, bot: Bot):
+    u = upsert_user(m)
+    if u["status"] == "banned":
+        return
+    if not cups_enabled():
+        await m.answer("Канал Cups.online на этом сервере не включён.")
+        return
+    ex("UPDATE channels SET status='cancelled' WHERE tg_id=? AND status='choosing'", u["tg_id"])
+    if q1("SELECT id FROM channels WHERE tg_id=? AND status='pending'", u["tg_id"]):
+        await m.answer("У тебя уже есть заявка на рассмотрении.")
+        return
+    await m.answer(
+        "ℹ️ Канал через комнаты Cups.online: документ не нужен, комнаты создаёт сервер. "
+        "Если канал перезапустится, комнаты станут новыми, и профиль придётся импортировать заново — бот пришлёт его сам. "
+        "Трафик зашифрован ключом из профиля."
+    )
+    ch_id = ex(
+        "INSERT INTO channels(tg_id, transport, url, status, created, use_secret) VALUES(?,?,?,'pending',?,1)",
+        u["tg_id"], "cups", "cups", int(time.time()),
     )
     await submit_channel(bot, ch_id)
 
@@ -1586,6 +1693,10 @@ configure() {
     echo "DIRECT_PORT_MIN=$(env_or DIRECT_PORT_MIN 20000)"
     echo "DIRECT_PORT_MAX=$(env_or DIRECT_PORT_MAX 20999)"
     echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
+    echo "CUPS_ENABLED=$(env_or CUPS_ENABLED 1)"
+    echo "CUPS_TIMEOUT=$(env_or CUPS_TIMEOUT 90)"
+    echo "TYPE_CUPS=$(env_or TYPE_CUPS cupsonline)"
+    echo "ARGS_CUPS=$(env_or ARGS_CUPS '--role=exit --transport=cupsonline')"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
   chmod 600 "$BOT_DIR/.env"
