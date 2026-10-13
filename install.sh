@@ -318,13 +318,17 @@ URL_CHECK_HEADERS = {
     "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
 }
+# Mail.ru отдаёт заголовки длиннее лимита aiohttp по умолчанию (8190 байт): один только
+# content-security-policy-report-only занимает около 9 КБ. Без этого aiohttp падает с
+# ClientResponseError, хотя документ открывается.
+URL_CHECK_LIMITS = {"max_line_size": 65536, "max_field_size": 65536}
 
 
 async def url_check(url):
     """→ (ok, reason). reason: "HTTP 403" или имя ошибки сети; пусто, если всё хорошо."""
     try:
         timeout = aiohttp.ClientTimeout(total=15)
-        async with aiohttp.ClientSession(timeout=timeout, headers=URL_CHECK_HEADERS) as s:
+        async with aiohttp.ClientSession(timeout=timeout, headers=URL_CHECK_HEADERS, **URL_CHECK_LIMITS) as s:
             async with s.get(url, allow_redirects=True) as r:
                 if r.status < 400:
                     return True, ""
@@ -344,6 +348,11 @@ def url_check_message(reason):
             f"Сервис ответил <code>{esc(reason)}</code>. Либо документ закрыт для доступа по ссылке, "
             "либо сервис не пускает сервер бота. Проверь доступ «по ссылке» и повтори; "
             "если так и остаётся — админ увидит причину в логах бота."
+        )
+    if reason == "ClientResponseError":
+        return (
+            "Сервис ответил так, что бот не смог разобрать ответ (например, слишком длинные заголовки). "
+            "Админ увидит подробности в логах бота."
         )
     return (
         f"Сервер бота не смог подключиться к сервису (<code>{esc(reason)}</code>). "
