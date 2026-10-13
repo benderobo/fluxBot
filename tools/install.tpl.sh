@@ -105,17 +105,54 @@ OFEOF_ENTRY
 }
 
 # ---------------- бинарник OpenFlux ----------------
+# Сверка SHA-256 скачанного релиза. Ожидаемый хеш берём из OFBOT_OF_SHA256 (пин),
+# иначе из файла .sha256 / checksums среди ассетов релиза. Нет хеша — только с подтверждением.
+# $1 — скачанный файл, $2 — имя ассета, $3 — JSON релиза
+verify_asset() {
+  local file=$1 name=$2 rel=$3 exp="" sumurl sumf n got
+  if [ -n "${OFBOT_OF_SHA256:-}" ]; then
+    exp=${OFBOT_OF_SHA256,,}
+  else
+    sumurl=$(jq -r --arg n "$name" '.assets[]?.browser_download_url
+        | select(endswith($n + ".sha256") or test("(?i)(sha256sums?|checksums?)(\\.txt)?$"))' <<<"$rel" | head -n1)
+    if [ -n "$sumurl" ]; then
+      sumf=$(mktemp)
+      if curl -fsSL "$sumurl" -o "$sumf" 2>/dev/null; then
+        exp=$(grep -F "$name" "$sumf" | grep -oiE '\b[0-9a-f]{64}\b' | head -n1)
+        if [ -z "$exp" ]; then  # файл с единственным хешем без имени
+          n=$(grep -oiE '\b[0-9a-f]{64}\b' "$sumf" | wc -l)
+          [ "$n" -eq 1 ] && exp=$(grep -oiE '\b[0-9a-f]{64}\b' "$sumf")
+        fi
+        exp=${exp,,}
+      fi
+      rm -f "$sumf"
+    fi
+  fi
+  got=$(sha256sum "$file" | cut -d' ' -f1)
+  if [ -z "$exp" ]; then
+    warn "У релиза нет файла SHA-256 для $name — целостность не проверить (sha256: $got)"
+    confirm "Установить без проверки?" || return 1
+    return 0
+  fi
+  if [ "$got" != "$exp" ]; then
+    err "SHA-256 не совпал для $name: ожидался $exp, получен $got"
+    return 1
+  fi
+  ok "SHA-256 совпал: $got"
+}
+
 fetch_release() {
-  local a url tmp f
+  local a url tmp f rel
   a=$(cpu_arch)
   info "Ищу релиз $OF_REPO для linux-$a..."
-  url=$(curl -fsSL "https://api.github.com/repos/$OF_REPO/releases/latest" 2>/dev/null \
-    | jq -r --arg a "$a" '.assets[]?.browser_download_url
+  rel=$(curl -fsSL "https://api.github.com/repos/$OF_REPO/releases/latest" 2>/dev/null)
+  url=$(jq -r --arg a "$a" '.assets[]?.browser_download_url
         | select(test("linux"; "i") and test($a))
-        | select(test("\\.(sha256|sig|txt|md)$") | not)' 2>/dev/null | head -n1)
+        | select(test("\\.(sha256|sig|txt|md)$") | not)' <<<"$rel" 2>/dev/null | head -n1)
   [ -z "$url" ] && return 1
   tmp=$(mktemp -d)
   curl -fL --progress-bar "$url" -o "$tmp/asset" || { rm -rf "$tmp"; return 1; }
+  verify_asset "$tmp/asset" "$(basename "$url")" "$rel" || { rm -rf "$tmp"; return 1; }
   case "$url" in
     *.tar.gz|*.tgz) tar xzf "$tmp/asset" -C "$tmp" ;;
     *.zip) command -v unzip >/dev/null || apt-get install -y -qq unzip >/dev/null; unzip -q "$tmp/asset" -d "$tmp" ;;
@@ -146,7 +183,7 @@ build_from_source() {
 
 fetch_binary() {
   fetch_release && return 0
-  warn "Готовый Linux-релиз не найден"
+  warn "Готовый релиз недоступен или не прошёл проверку"
   local p; p=$(ask "Путь к готовому бинарнику (пусто — собрать из исходников)" "")
   if [ -n "$p" ]; then
     [ -f "$p" ] || { err "Файл $p не найден"; return 1; }
