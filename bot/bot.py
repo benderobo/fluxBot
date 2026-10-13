@@ -135,7 +135,8 @@ HELP_USER = (
     + "• Mail.ru: <code>https://cloud.mail.ru/public/...</code>\n\n"
     "В ответ придёт конфиг для OpenFlux.\n"
     "/myconfig — прислать мой конфиг ещё раз\n"
-    "/client — скачать клиент"
+    "/client — скачать клиент\n"
+    "/delete — удалить мой канал"
 )
 HELP_ADMIN = (
     "<b>Админ</b>\n"
@@ -143,7 +144,8 @@ HELP_ADMIN = (
     "/channels — каналы\n"
     "/status — состояние сервера\n"
     "/give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex] — выдать канал\n"
-    "/revoke &lt;channel_id&gt; — остановить канал\n"
+    "/delete [channel_id] — удалить канал (с подтверждением; без номера — свои)\n"
+    "/revoke &lt;channel_id&gt; — остановить канал сразу, без подтверждения\n"
     "/ban &lt;tg_id&gt; · /unban &lt;tg_id&gt;\n"
     "/decode &lt;openflux://v1/...&gt; — показать JSON профиля"
 )
@@ -503,10 +505,24 @@ async def stop_channel(ch):
     set_channel(ch["id"], "stopped")
 
 
+async def delete_channel(ch):
+    """Удалить канал: запущенный останавливается, ожидающий заявку — снимается. → итоговый статус."""
+    if ch["status"] == "pending":
+        # контейнер мог уже создаться (канал стартует), поэтому убираем и его
+        await asyncio.to_thread(_remove_container, ch["container"])
+        set_channel(ch["id"], "cancelled")
+        ex("UPDATE users SET status='new' WHERE tg_id=? AND status='pending'", ch["tg_id"])
+        return "cancelled"
+    await stop_channel(ch)
+    return "stopped"
+
+
 # ---------- жизненный цикл канала ----------
 async def provision(bot: Bot, ch_id):
     try:
         ch = q1("SELECT * FROM channels WHERE id=?", ch_id)
+        if not ch or ch["status"] != "pending":
+            return  # заявку успели удалить или отклонить
         olds = q("SELECT * FROM channels WHERE tg_id=? AND status='running' AND id<>?", ch["tg_id"], ch_id)
         running = q1("SELECT COUNT(*) AS n FROM channels WHERE status='running'")["n"]
         if running - len(olds) >= MAX_CHANNELS:
@@ -521,6 +537,11 @@ async def provision(bot: Bot, ch_id):
         ex("UPDATE channels SET container=? WHERE id=?", name, ch_id)
         await asyncio.sleep(STARTUP_WAIT)
         status, logs, started_at = await asyncio.to_thread(_container_state, name)
+
+        cur = q1("SELECT status FROM channels WHERE id=?", ch_id)
+        if not cur or cur["status"] != "pending":  # канал удалили, пока он запускался
+            await asyncio.to_thread(_remove_container, name)
+            return
 
         if status == "running" and use_secret and SECRET_METHOD == "log":
             secret, logs = await wait_secret(name)
@@ -866,7 +887,10 @@ async def cmd_channels(m: Message):
         for r in rows
     ]
     total = q1("SELECT COUNT(*) AS n FROM channels WHERE status='running'")["n"]
-    await m.answer(f"Запущено: {total}/{MAX_CHANNELS}\n\n" + ("\n".join(lines) or "Нет активных"))
+    await m.answer(
+        f"Запущено: {total}/{MAX_CHANNELS}\n\n" + ("\n".join(lines) or "Нет активных"),
+        reply_markup=kb_delete_list(rows[:20]) if rows else None,
+    )
 
 
 GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex]"
@@ -929,9 +953,111 @@ async def cmd_revoke(m: Message, command: CommandObject, bot: Bot):
     if not ch:
         await m.answer("Канал не найден.")
         return
-    await stop_channel(ch)
+    await delete_channel(ch)
     await notify_user(bot, ch["tg_id"], "Твой канал остановлен администратором.")
     await m.answer(f"Канал #{ch['id']} остановлен.")
+
+
+# ---------- удаление каналов ----------
+DELETABLE = ("running", "pending")
+
+
+def channel_title(ch):
+    return f"#{ch['id']} · {ch['transport']} {lock_icon(ch)}"
+
+
+def can_delete(user_id, ch):
+    return bool(ch) and ch["status"] in DELETABLE and (is_admin(user_id) or ch["tg_id"] == user_id)
+
+
+def kb_delete_list(channels):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"🗑 {channel_title(ch)}", callback_data=f"del:{ch['id']}")] for ch in channels
+    ])
+
+
+def kb_delete_confirm(ch_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да, удалить", callback_data=f"delok:{ch_id}"),
+        InlineKeyboardButton(text="↩️ Отмена", callback_data="delno"),
+    ]])
+
+
+def delete_prompt(ch):
+    if ch["status"] == "pending":
+        return f"Отозвать заявку на канал {channel_title(ch)}?"
+    return (
+        f"Удалить канал {channel_title(ch)}?\n"
+        "Он перестанет работать, а профиль в клиенте станет недействительным. Отменить это нельзя."
+    )
+
+
+def channel_from_callback(data, prefix):
+    raw = data[len(prefix):]
+    return q1("SELECT * FROM channels WHERE id=?", int(raw)) if raw.isdigit() else None
+
+
+@router.message(Command("delete"))
+async def cmd_delete(m: Message, command: CommandObject):
+    u = upsert_user(m)
+    if u["status"] == "banned":
+        return
+    arg = (command.args or "").strip()
+    if arg:
+        if not is_admin(m.from_user.id):
+            await m.answer("Номер канала указывает только админ. Пришли просто /delete.")
+            return
+        ch = q1("SELECT * FROM channels WHERE id=?", int(arg)) if arg.isdigit() else None
+        if not can_delete(m.from_user.id, ch):
+            await m.answer("Активный канал с таким номером не найден.")
+            return
+        await m.answer(delete_prompt(ch), reply_markup=kb_delete_confirm(ch["id"]))
+        return
+    channels = q("SELECT * FROM channels WHERE tg_id=? AND status IN ('running','pending') ORDER BY id DESC", m.from_user.id)
+    if not channels:
+        await m.answer("У тебя нет активных каналов.")
+    elif len(channels) == 1:
+        await m.answer(delete_prompt(channels[0]), reply_markup=kb_delete_confirm(channels[0]["id"]))
+    else:
+        await m.answer("Какой канал удалить?", reply_markup=kb_delete_list(channels))
+
+
+@router.callback_query(F.data.startswith("del:"))
+async def cb_delete(c: CallbackQuery):
+    ch = channel_from_callback(c.data, "del:")
+    if not ch or ch["status"] not in DELETABLE:
+        await c.answer("Уже неактуально")
+        return
+    if not can_delete(c.from_user.id, ch):
+        await c.answer("Это не твой канал", show_alert=True)
+        return
+    await c.message.answer(delete_prompt(ch), reply_markup=kb_delete_confirm(ch["id"]))
+    await c.answer()
+
+
+@router.callback_query(F.data.startswith("delok:"))
+async def cb_delete_ok(c: CallbackQuery, bot: Bot):
+    ch = channel_from_callback(c.data, "delok:")
+    if not ch or ch["status"] not in DELETABLE:
+        await c.answer("Уже неактуально")
+        return
+    if not can_delete(c.from_user.id, ch):
+        await c.answer("Это не твой канал", show_alert=True)
+        return
+    await delete_channel(ch)
+    await c.message.edit_text(f"🗑 Канал {channel_title(ch)} удалён. Чтобы получить новый, пришли ссылку на документ.")
+    await c.answer()
+    if ch["tg_id"] == c.from_user.id:
+        if not is_admin(c.from_user.id):
+            await notify_admins(bot, f"🗑 Пользователь <code>{ch['tg_id']}</code> удалил канал #{ch['id']} ({ch['transport']})")
+    else:
+        await notify_user(bot, ch["tg_id"], f"Твой канал #{ch['id']} удалён администратором.")
+
+
+@router.callback_query(F.data == "delno")
+async def cb_delete_no(c: CallbackQuery):
+    await c.message.edit_text("Отменено.")
+    await c.answer()
 
 
 @router.message(Command("ban"))
