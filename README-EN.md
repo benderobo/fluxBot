@@ -45,7 +45,7 @@ Every channel is a separate container with its own network namespace, RAM/CPU li
 - 🔑 Channels with a secret (AES-256-GCM) or without — user's choice
 - 📲 Native `openflux://v1` profiles plus QR for one-tap import
 - 🐳 One container per channel, resource limits, `RST DROP` scoped to its netns
-- 🐕 Watchdog: crashed channels, secret changes, Yandex captcha, disk and RAM
+- 🐕 Watchdog: crashed channels, secret changes, Yandex captcha (Yandex transports only), a channel that stays disconnected from its document, disk and RAM
 - 🔄 OpenFlux updates without dropping channels or losing secrets
 - 💾 Backup and restore from the menu
 

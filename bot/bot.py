@@ -527,7 +527,61 @@ async def wait_secret(name):
     return None, logs
 
 
-CAPTCHA_MARKERS = ("captcha required", "captcha")
+# Настоящие признаки капчи/входа Яндекса — тексты ошибок OpenFlux ("yandex docs: captcha required",
+# "captcha solve: ...", "yandex docs: login required"). Само слово «captcha» признаком НЕ является: оно есть в общей
+# подсказке ядра "no carrier is connected on this side (document unreachable, captcha, or network)", которая
+# выводится при любой потере связи с документом, в том числе у Mail.ru, где капчи нет.
+CAPTCHA_MARKERS = ("captcha required", "captcha solve:", "login required")
+YANDEX_TRANSPORTS = {"yandex", "vyandex", "boards"}
+# Признаки того, что узел не подключён к документу (строки уровня Info, видны без отладки)
+NO_CARRIER_MARKERS = ("no carrier is connected", "cannot open the document")
+CARRIER_ALERT_TICKS = 2  # столько проверок подряд (по минуте), прежде чем предупреждать админа
+CARRIER_CLEAR_TICKS = 2
+
+
+def has_captcha(transport, logs):
+    return transport in YANDEX_TRANSPORTS and any(mk in (logs or "").lower() for mk in CAPTCHA_MARKERS)
+
+
+def carrier_down(logs):
+    return any(mk in (logs or "").lower() for mk in NO_CARRIER_MARKERS)
+
+
+def carrier_detail(logs):
+    """Последняя строка лога про отсутствие связи с документом — для сообщения админу."""
+    lines = [ln for ln in (logs or "").splitlines() if any(mk in ln.lower() for mk in NO_CARRIER_MARKERS)]
+    return lines[-1].strip()[-300:] if lines else ""
+
+
+class CarrierTracker:
+    """Отличает «связи с документом нет уже несколько минут» от разовой строки в логе (дребезга):
+    update() → "alert" после ALERT подряд плохих проверок, "clear" после CLEAR подряд хороших, иначе None."""
+
+    def __init__(self, alert_ticks=CARRIER_ALERT_TICKS, clear_ticks=CARRIER_CLEAR_TICKS):
+        self.alert_ticks, self.clear_ticks = alert_ticks, clear_ticks
+        self.bad, self.good, self.alerted = {}, {}, set()
+
+    def update(self, ch_id, down):
+        if down:
+            self.good.pop(ch_id, None)
+            self.bad[ch_id] = self.bad.get(ch_id, 0) + 1
+            if self.bad[ch_id] >= self.alert_ticks and ch_id not in self.alerted:
+                self.alerted.add(ch_id)
+                return "alert"
+        else:
+            self.bad.pop(ch_id, None)
+            if ch_id in self.alerted:
+                self.good[ch_id] = self.good.get(ch_id, 0) + 1
+                if self.good[ch_id] >= self.clear_ticks:
+                    self.alerted.discard(ch_id)
+                    self.good.pop(ch_id, None)
+                    return "clear"
+        return None
+
+    def forget(self, ch_id):
+        self.bad.pop(ch_id, None)
+        self.good.pop(ch_id, None)
+        self.alerted.discard(ch_id)
 
 
 def _recent_logs(name, seconds=180):
@@ -668,13 +722,53 @@ def host_stats():
     }
 
 
+async def check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier):
+    """Разбирает логи работающего канала: настоящая капча Яндекса и потеря связи с документом."""
+    captcha = has_captcha(ch["transport"], recent)
+    if captcha and ch["id"] not in captcha_alerted:
+        captcha_alerted.add(ch["id"])
+        await notify_admins(
+            bot,
+            f"🧩 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}): Яндекс требует капчу или вход для IP узла.\n"
+            "Пока это не пройдено, канал не передаёт трафик.",
+        )
+        await notify_user(
+            bot, ch["tg_id"],
+            "🧩 Яндекс попросил капчу для твоего канала, пока он может не работать. Админ в курсе.",
+        )
+    elif not captcha and ch["id"] in captcha_alerted:
+        captcha_alerted.discard(ch["id"])
+        await notify_admins(bot, f"✅ Канал #{ch['id']}: признаков капчи в логах больше нет")
+
+    # связь с документом: предупреждаем только админа и только если это длится, а не одна строка в логе.
+    # Если уже есть настоящая капча — отдельное сообщение не нужно, причина понятна.
+    down = (not captcha) and carrier_down(last_minute)
+    event = carrier.update(ch["id"], down)
+    if event == "alert":
+        detail = carrier_detail(last_minute)
+        await notify_admins(
+            bot,
+            f"🔌 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}) не подключён к документу уже несколько минут.\n"
+            "Проверьте, что ссылка открыта, документ не удалён и на нём нет второго узла (один документ — одно устройство). "
+            "Подробности — в логах контейнера."
+            + (f"\n<pre>{esc(detail)}</pre>" if detail else ""),
+        )
+    elif event == "clear":
+        await notify_admins(bot, f"✅ Канал #{ch['id']}: связь с документом восстановилась")
+
+
 async def watchdog(bot: Bot):
     alerted = {"disk": False, "mem": False}
     captcha_alerted = set()  # id каналов, по которым уже предупредили
+    carrier = CarrierTracker()
     while True:
         await asyncio.sleep(60)
         try:
-            for ch in q("SELECT * FROM channels WHERE status='running'"):
+            running = q("SELECT * FROM channels WHERE status='running'")
+            for gone in {i for i in (*carrier.bad, *carrier.good, *carrier.alerted, *captcha_alerted)} - {r["id"] for r in running}:
+                carrier.forget(gone)  # канал остановили или удалили — не копим состояние
+                captcha_alerted.discard(gone)
+            for ch in running:
                 status, logs, started_at = await asyncio.to_thread(_container_state, ch["container"], 300)
                 if status != "running":
                     set_channel(ch["id"], "failed")
@@ -682,23 +776,9 @@ async def watchdog(bot: Bot):
                     await notify_admins(bot, f"⚠️ Канал #{ch['id']} ({ch['tg_id']}) упал: {status}\n<pre>{esc(logs[-1500:])}</pre>")
                     continue
 
-                recent = (await asyncio.to_thread(_recent_logs, ch["container"])).lower()
-                has_captcha = any(mk in recent for mk in CAPTCHA_MARKERS)
-                if has_captcha and ch["id"] not in captcha_alerted:
-                    captcha_alerted.add(ch["id"])
-                    await notify_admins(
-                        bot,
-                        f"🧩 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}): Яндекс требует капчу для IP узла.\n"
-                        "Пока она не пройдена, канал не передаёт трафик.",
-                    )
-                    await notify_user(
-                        bot, ch["tg_id"],
-                        "🧩 Яндекс попросил капчу для твоего канала, пока он может не работать. "
-                        "Админ в курсе.",
-                    )
-                elif not has_captcha and ch["id"] in captcha_alerted:
-                    captcha_alerted.discard(ch["id"])
-                    await notify_admins(bot, f"✅ Канал #{ch['id']}: капча больше не встречается в логах")
+                recent = await asyncio.to_thread(_recent_logs, ch["container"])
+                last_minute = await asyncio.to_thread(_recent_logs, ch["container"], 60)
+                await check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier)
                 if started_at and started_at != ch["started_at"]:
                     # контейнер перезапускался (краш, ребут, обновление OpenFlux)
                     from_log = wants_secret(ch) and SECRET_METHOD == "log"
