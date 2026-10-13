@@ -1,0 +1,4 @@
+aiogram>=3.13,<4
+aiohttp>=3.9
+docker>=7.1
+qrcode[pil]>=7.4
