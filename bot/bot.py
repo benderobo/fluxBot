@@ -41,7 +41,17 @@ ARGS_TEMPLATES = {
     "yandex": os.getenv("ARGS_YANDEX", "--role=exit --transport=yandex --url {url}"),
     "mailru": os.getenv("ARGS_MAILRU", "--role=exit --transport=mailru --url {url}"),
     "vyandex": os.getenv("ARGS_VYANDEX", "--role=exit --transport=vyandex --url {url}"),
+    "boards": os.getenv("ARGS_BOARDS", "--role=exit --transport=boards --url {url}"),
+    # прямой TCP: узел слушает порт, который бот публикует наружу (см. PUBLIC_HOST)
+    "direct": os.getenv("ARGS_DIRECT", "--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}"),
 }
+# Прямое TCP-подключение к серверу (без документа). Включается, только если задан PUBLIC_HOST — публичный адрес сервера.
+# Адрес узла в этом режиме виден, поэтому он не маскируется; ключ шифрования обязателен.
+PUBLIC_HOST = (os.getenv("PUBLIC_HOST") or "").strip()
+DIRECT_PORT_MIN = int(os.getenv("DIRECT_PORT_MIN") or "20000")
+DIRECT_PORT_MAX = int(os.getenv("DIRECT_PORT_MAX") or "20999")
+DIRECT_CONTEXT = "http://#"  # контекст ключа узла без --url (проверено официальным --make-link и узлом)
+DIRECT_PRIORITY = 50  # как directPriority в OpenFlux
 # Секрет канала
 # SECRET_CHOICE: ask — пользователь выбирает кнопкой; always — всегда с секретом; never — всегда без
 # SECRET_METHOD: как получить секрет для каналов «с секретом»:
@@ -76,6 +86,7 @@ TRANSPORT_TYPES = {
     "yandex": os.getenv("TYPE_YANDEX") or "yandex",
     "mailru": os.getenv("TYPE_MAILRU") or "mailru",
     "vyandex": os.getenv("TYPE_VYANDEX") or "vyandex",
+    "boards": os.getenv("TYPE_BOARDS") or "boards",
 }
 
 # отправлять конфиг ещё и QR-кодом (iOS-клиент импортирует профили через QR)
@@ -123,7 +134,13 @@ VYANDEX_URL_RE = re.compile(
 )
 VYANDEX_MODE = (os.getenv("VYANDEX_MODE") or "off").lower()
 
+def direct_enabled():
+    return bool(PUBLIC_HOST) and CONFIG_FORMAT == "openflux-v1"
+
+
+# Yandex Boards: транспорт берёт из ссылки только параметр hash (так же делает extractBoardsHash в OpenFlux)
 URL_RULES = [
+    (re.compile(r"^https://boards\.yandex\.ru/[^\s#]*[?&]hash=[^&\s#]{6,}[^\s#]*(?:#\S*)?$"), "boards"),
     (re.compile(r"^https://(disk|docs)\.yandex\.(ru|com)/\S+$"), "yandex"),
     (re.compile(r"^https://cloud\.mail\.ru/\S+$"), "mailru"),
 ]
@@ -132,18 +149,20 @@ HELP_USER = (
     "Пришли ссылку на <b>публичный</b> документ (доступ по ссылке):\n"
     "• Yandex Docs: <code>https://disk.yandex.ru/i/...</code> (старый редактор)\n"
     + ("• Yandex Docs (новый редактор): <code>https://docs.yandex.ru/edit/d/...</code>\n" if VYANDEX_MODE == "auto" else "")
+    + "• Yandex Boards: <code>https://boards.yandex.ru/guest/?hash=...</code>\n"
     + "• Mail.ru: <code>https://cloud.mail.ru/public/...</code>\n\n"
     "В ответ придёт конфиг для OpenFlux.\n"
     "/myconfig — прислать мой конфиг ещё раз\n"
     "/client — скачать клиент\n"
     "/delete — удалить мой канал"
+    + ("\n/direct — канал без документа: прямое TCP-подключение (адрес сервера виден)" if direct_enabled() else "")
 )
 HELP_ADMIN = (
     "<b>Админ</b>\n"
     "/users — пользователи\n"
     "/channels — каналы\n"
     "/status — состояние сервера\n"
-    "/give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex] — выдать канал\n"
+    "/give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex] — выдать канал\n"
     "/delete [channel_id] — удалить канал (с подтверждением; без номера — свои)\n"
     "/revoke &lt;channel_id&gt; — остановить канал сразу, без подтверждения\n"
     "/ban &lt;tg_id&gt; · /unban &lt;tg_id&gt;\n"
@@ -181,6 +200,8 @@ def init_db():
             c.execute("ALTER TABLE channels ADD COLUMN started_at TEXT")
         if "use_secret" not in cols:
             c.execute("ALTER TABLE channels ADD COLUMN use_secret INTEGER")
+        if "port" not in cols:
+            c.execute("ALTER TABLE channels ADD COLUMN port INTEGER")
 
 
 def q(sql, *args):
@@ -218,7 +239,11 @@ def clean_link(url):
 
 def canonical_url(url, transport):
     # ссылка попадает и в --url узла, и в context профиля: обе стороны берут одну строку
-    return clean_link(url) if transport == "vyandex" else url
+    if transport == "vyandex":
+        return clean_link(url)
+    if transport == "boards":
+        return url.split("#", 1)[0]  # query нужен (там hash), фрагмент — нет
+    return url
 
 
 def detect_transport(url):
@@ -282,6 +307,21 @@ def url_check_message(reason):
     )
 
 
+# Для этих сервисов проверка ссылки не подтверждена на практике: ответ 4xx/5xx (кроме 404/410) не блокирует
+# выдачу канала, а только пишется в лог. Недоступный документ всё равно виден по логам узла.
+SOFT_CHECK_TRANSPORTS = {"boards"}
+
+
+def check_blocks(transport, ok, reason):
+    """Нужно ли отказать пользователю по результату проверки ссылки."""
+    if ok:
+        return False
+    if transport in SOFT_CHECK_TRANSPORTS and reason.startswith("HTTP ") and reason not in ("HTTP 404", "HTTP 410"):
+        log.warning("link check for %s answered %s, continuing anyway", transport, reason)
+        return False
+    return True
+
+
 async def url_alive(url):
     return (await url_check(url))[0]
 
@@ -321,6 +361,11 @@ def build_config(ch):
     if CONFIG_FORMAT == "openflux-v1":
         name = CONFIG_NAME.format(id=ch["id"], tg_id=ch["tg_id"], transport=ch["transport"])
         obj = {"name": name}
+        if ch["transport"] == "direct":
+            # сессия с проверкой участников: ключ обязателен, context — по умолчанию узла без --url
+            obj.update(negotiate=True, secret=ch["secret"], context=DIRECT_CONTEXT)
+            obj["transports"] = [{"type": "direct", "dial": ch["url"], "priority": DIRECT_PRIORITY}]
+            return encode_openflux_v1(obj)
         if wants_secret(ch) and ch["secret"]:
             # AES-256-GCM: ключ выводится из секрета и ссылки на документ (context),
             # поэтому context обязан совпадать с --url канала до символа
@@ -430,10 +475,11 @@ def _run_container(ch, secret=None):
     toks = shlex.split(tpl)
     if not secret:
         toks = strip_secret_tokens(toks)
-    fmt = {"url": ch["url"], "secret": secret or ""}
+    fmt = {"url": ch["url"], "secret": secret or "", "port": ch["port"]}
     args = [t.format(**fmt) for t in toks]
     env = {}
-    if secret and SECRET_METHOD == "generate" and "{secret}" not in tpl:
+    direct = ch["transport"] == "direct"
+    if secret and (SECRET_METHOD == "generate" or direct) and "{secret}" not in tpl:
         if SECRET_ARG:
             args += [t.format(**fmt) for t in shlex.split(SECRET_ARG)]
         else:
@@ -452,6 +498,7 @@ def _run_container(ch, secret=None):
             type="json-file", config={"max-size": "10m", "max-file": "2"}
         ),
         labels={"openflux.bot": "1", "openflux.channel": str(ch["id"])},
+        ports={f"{ch['port']}/tcp": ch["port"]} if direct else None,
     )
     return name
 
@@ -480,7 +527,61 @@ async def wait_secret(name):
     return None, logs
 
 
-CAPTCHA_MARKERS = ("captcha required", "captcha")
+# Настоящие признаки капчи/входа Яндекса — тексты ошибок OpenFlux ("yandex docs: captcha required",
+# "captcha solve: ...", "yandex docs: login required"). Само слово «captcha» признаком НЕ является: оно есть в общей
+# подсказке ядра "no carrier is connected on this side (document unreachable, captcha, or network)", которая
+# выводится при любой потере связи с документом, в том числе у Mail.ru, где капчи нет.
+CAPTCHA_MARKERS = ("captcha required", "captcha solve:", "login required")
+YANDEX_TRANSPORTS = {"yandex", "vyandex", "boards"}
+# Признаки того, что узел не подключён к документу (строки уровня Info, видны без отладки)
+NO_CARRIER_MARKERS = ("no carrier is connected", "cannot open the document")
+CARRIER_ALERT_TICKS = 2  # столько проверок подряд (по минуте), прежде чем предупреждать админа
+CARRIER_CLEAR_TICKS = 2
+
+
+def has_captcha(transport, logs):
+    return transport in YANDEX_TRANSPORTS and any(mk in (logs or "").lower() for mk in CAPTCHA_MARKERS)
+
+
+def carrier_down(logs):
+    return any(mk in (logs or "").lower() for mk in NO_CARRIER_MARKERS)
+
+
+def carrier_detail(logs):
+    """Последняя строка лога про отсутствие связи с документом — для сообщения админу."""
+    lines = [ln for ln in (logs or "").splitlines() if any(mk in ln.lower() for mk in NO_CARRIER_MARKERS)]
+    return lines[-1].strip()[-300:] if lines else ""
+
+
+class CarrierTracker:
+    """Отличает «связи с документом нет уже несколько минут» от разовой строки в логе (дребезга):
+    update() → "alert" после ALERT подряд плохих проверок, "clear" после CLEAR подряд хороших, иначе None."""
+
+    def __init__(self, alert_ticks=CARRIER_ALERT_TICKS, clear_ticks=CARRIER_CLEAR_TICKS):
+        self.alert_ticks, self.clear_ticks = alert_ticks, clear_ticks
+        self.bad, self.good, self.alerted = {}, {}, set()
+
+    def update(self, ch_id, down):
+        if down:
+            self.good.pop(ch_id, None)
+            self.bad[ch_id] = self.bad.get(ch_id, 0) + 1
+            if self.bad[ch_id] >= self.alert_ticks and ch_id not in self.alerted:
+                self.alerted.add(ch_id)
+                return "alert"
+        else:
+            self.bad.pop(ch_id, None)
+            if ch_id in self.alerted:
+                self.good[ch_id] = self.good.get(ch_id, 0) + 1
+                if self.good[ch_id] >= self.clear_ticks:
+                    self.alerted.discard(ch_id)
+                    self.good.pop(ch_id, None)
+                    return "clear"
+        return None
+
+    def forget(self, ch_id):
+        self.bad.pop(ch_id, None)
+        self.good.pop(ch_id, None)
+        self.alerted.discard(ch_id)
 
 
 def _recent_logs(name, seconds=180):
@@ -498,6 +599,16 @@ def _remove_container(name):
         dk.containers.get(name).remove(force=True)
     except docker.errors.NotFound:
         pass
+
+
+def allocate_port(ch_id):
+    """Свободный порт из диапазона для прямого канала; сохраняет его и адрес host:port в записи. None, если порты кончились."""
+    used = {r["port"] for r in q("SELECT port FROM channels WHERE port IS NOT NULL AND status IN ('running','pending')")}
+    for p in range(DIRECT_PORT_MIN, DIRECT_PORT_MAX + 1):
+        if p not in used:
+            ex("UPDATE channels SET port=?, url=? WHERE id=?", p, f"{PUBLIC_HOST}:{p}", ch_id)
+            return p
+    return None
 
 
 async def stop_channel(ch):
@@ -531,8 +642,15 @@ async def provision(bot: Bot, ch_id):
             await notify_admins(bot, f"⚠️ Лимит каналов ({MAX_CHANNELS}) исчерпан, заявка #{ch_id} не запущена.")
             return
 
+        if ch["transport"] == "direct":
+            if not PUBLIC_HOST or allocate_port(ch_id) is None:
+                set_channel(ch_id, "failed")
+                await notify_user(bot, ch["tg_id"], "Сейчас нельзя выдать прямой канал, попробуй позже.")
+                await notify_admins(bot, f"⚠️ Прямой канал #{ch_id}: нет PUBLIC_HOST или свободных портов {DIRECT_PORT_MIN}-{DIRECT_PORT_MAX}.")
+                return
+            ch = q1("SELECT * FROM channels WHERE id=?", ch_id)
         use_secret = wants_secret(ch)
-        secret = secrets.token_urlsafe(24) if use_secret and SECRET_METHOD == "generate" else None
+        secret = secrets.token_urlsafe(24) if use_secret and (SECRET_METHOD == "generate" or ch["transport"] == "direct") else None
         name = await asyncio.to_thread(_run_container, ch, secret)
         ex("UPDATE channels SET container=? WHERE id=?", name, ch_id)
         await asyncio.sleep(STARTUP_WAIT)
@@ -543,7 +661,7 @@ async def provision(bot: Bot, ch_id):
             await asyncio.to_thread(_remove_container, name)
             return
 
-        if status == "running" and use_secret and SECRET_METHOD == "log":
+        if status == "running" and use_secret and SECRET_METHOD == "log" and ch["transport"] != "direct":
             secret, logs = await wait_secret(name)
             if not secret:
                 await asyncio.to_thread(_remove_container, name)
@@ -604,13 +722,53 @@ def host_stats():
     }
 
 
+async def check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier):
+    """Разбирает логи работающего канала: настоящая капча Яндекса и потеря связи с документом."""
+    captcha = has_captcha(ch["transport"], recent)
+    if captcha and ch["id"] not in captcha_alerted:
+        captcha_alerted.add(ch["id"])
+        await notify_admins(
+            bot,
+            f"🧩 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}): Яндекс требует капчу или вход для IP узла.\n"
+            "Пока это не пройдено, канал не передаёт трафик.",
+        )
+        await notify_user(
+            bot, ch["tg_id"],
+            "🧩 Яндекс попросил капчу для твоего канала, пока он может не работать. Админ в курсе.",
+        )
+    elif not captcha and ch["id"] in captcha_alerted:
+        captcha_alerted.discard(ch["id"])
+        await notify_admins(bot, f"✅ Канал #{ch['id']}: признаков капчи в логах больше нет")
+
+    # связь с документом: предупреждаем только админа и только если это длится, а не одна строка в логе.
+    # Если уже есть настоящая капча — отдельное сообщение не нужно, причина понятна.
+    down = (not captcha) and carrier_down(last_minute)
+    event = carrier.update(ch["id"], down)
+    if event == "alert":
+        detail = carrier_detail(last_minute)
+        await notify_admins(
+            bot,
+            f"🔌 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}) не подключён к документу уже несколько минут.\n"
+            "Проверьте, что ссылка открыта, документ не удалён и на нём нет второго узла (один документ — одно устройство). "
+            "Подробности — в логах контейнера."
+            + (f"\n<pre>{esc(detail)}</pre>" if detail else ""),
+        )
+    elif event == "clear":
+        await notify_admins(bot, f"✅ Канал #{ch['id']}: связь с документом восстановилась")
+
+
 async def watchdog(bot: Bot):
     alerted = {"disk": False, "mem": False}
     captcha_alerted = set()  # id каналов, по которым уже предупредили
+    carrier = CarrierTracker()
     while True:
         await asyncio.sleep(60)
         try:
-            for ch in q("SELECT * FROM channels WHERE status='running'"):
+            running = q("SELECT * FROM channels WHERE status='running'")
+            for gone in {i for i in (*carrier.bad, *carrier.good, *carrier.alerted, *captcha_alerted)} - {r["id"] for r in running}:
+                carrier.forget(gone)  # канал остановили или удалили — не копим состояние
+                captcha_alerted.discard(gone)
+            for ch in running:
                 status, logs, started_at = await asyncio.to_thread(_container_state, ch["container"], 300)
                 if status != "running":
                     set_channel(ch["id"], "failed")
@@ -618,23 +776,9 @@ async def watchdog(bot: Bot):
                     await notify_admins(bot, f"⚠️ Канал #{ch['id']} ({ch['tg_id']}) упал: {status}\n<pre>{esc(logs[-1500:])}</pre>")
                     continue
 
-                recent = (await asyncio.to_thread(_recent_logs, ch["container"])).lower()
-                has_captcha = any(mk in recent for mk in CAPTCHA_MARKERS)
-                if has_captcha and ch["id"] not in captcha_alerted:
-                    captcha_alerted.add(ch["id"])
-                    await notify_admins(
-                        bot,
-                        f"🧩 Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}): Яндекс требует капчу для IP узла.\n"
-                        "Пока она не пройдена, канал не передаёт трафик.",
-                    )
-                    await notify_user(
-                        bot, ch["tg_id"],
-                        "🧩 Яндекс попросил капчу для твоего канала, пока он может не работать. "
-                        "Админ в курсе.",
-                    )
-                elif not has_captcha and ch["id"] in captcha_alerted:
-                    captcha_alerted.discard(ch["id"])
-                    await notify_admins(bot, f"✅ Канал #{ch['id']}: капча больше не встречается в логах")
+                recent = await asyncio.to_thread(_recent_logs, ch["container"])
+                last_minute = await asyncio.to_thread(_recent_logs, ch["container"], 60)
+                await check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier)
                 if started_at and started_at != ch["started_at"]:
                     # контейнер перезапускался (краш, ребут, обновление OpenFlux)
                     from_log = wants_secret(ch) and SECRET_METHOD == "log"
@@ -747,7 +891,7 @@ async def on_link(m: Message, bot: Bot):
         return
     await m.answer("Проверяю ссылку…")
     ok, reason = await url_check(url)
-    if not ok:
+    if check_blocks(transport, ok, reason):
         await m.answer(url_check_message(reason))
         return
 
@@ -893,12 +1037,17 @@ async def cmd_channels(m: Message):
     )
 
 
-GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url&gt; [secret|nosecret] [vyandex]"
+GIVE_USAGE = "Формат: /give &lt;tg_id&gt; &lt;url|direct&gt; [secret|nosecret] [vyandex]"
 
 
 def parse_give(args):
     """/give <tg_id> <url> [secret|nosecret] [vyandex] → ((tg_id, url, use_secret, transport), None) или (None, ошибка)."""
     parts = (args or "").split()
+    if len(parts) >= 2 and parts[0].isdigit() and parts[1].lower() == "direct":
+        # прямой канал: ссылки нет, ключ обязателен (nosecret недопустим)
+        if any(f != "secret" for f in parts[2:]) or len(parts) > 3:
+            return None, GIVE_USAGE
+        return (int(parts[0]), "direct", True, "direct"), None
     flags = parts[2:]
     allowed = {"secret", "nosecret", "vyandex"}
     if (
@@ -932,6 +1081,9 @@ async def cmd_give(m: Message, command: CommandObject, bot: Bot):
         await m.answer(error)
         return
     tg_id, url, use_secret, transport = parsed
+    if transport == "direct" and not direct_enabled():
+        await m.answer("Прямой канал выключен: задай PUBLIC_HOST в .env и перезапусти бота.")
+        return
     if not q1("SELECT tg_id FROM users WHERE tg_id=?", tg_id):
         await m.answer("Пользователь должен сначала написать боту /start.")
         return
@@ -956,6 +1108,30 @@ async def cmd_revoke(m: Message, command: CommandObject, bot: Bot):
     await delete_channel(ch)
     await notify_user(bot, ch["tg_id"], "Твой канал остановлен администратором.")
     await m.answer(f"Канал #{ch['id']} остановлен.")
+
+
+# ---------- прямой TCP ----------
+@router.message(Command("direct"))
+async def cmd_direct(m: Message, bot: Bot):
+    u = upsert_user(m)
+    if u["status"] == "banned":
+        return
+    if not direct_enabled():
+        await m.answer("Прямое подключение на этом сервере не включено.")
+        return
+    ex("UPDATE channels SET status='cancelled' WHERE tg_id=? AND status='choosing'", u["tg_id"])
+    if q1("SELECT id FROM channels WHERE tg_id=? AND status='pending'", u["tg_id"]):
+        await m.answer("У тебя уже есть заявка на рассмотрении.")
+        return
+    await m.answer(
+        "⚠️ Прямой канал не маскируется под документ: адрес сервера виден, и его могут заблокировать. "
+        "Трафик зашифрован ключом, который придёт в профиле."
+    )
+    ch_id = ex(
+        "INSERT INTO channels(tg_id, transport, url, status, created, use_secret) VALUES(?,?,?,'pending',?,1)",
+        u["tg_id"], "direct", "direct", int(time.time()),
+    )
+    await submit_channel(bot, ch_id)
 
 
 # ---------- удаление каналов ----------

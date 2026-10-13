@@ -45,7 +45,7 @@ Every channel is a separate container with its own network namespace, RAM/CPU li
 - 🔑 Channels with a secret (AES-256-GCM) or without — user's choice
 - 📲 Native `openflux://v1` profiles plus QR for one-tap import
 - 🐳 One container per channel, resource limits, `RST DROP` scoped to its netns
-- 🐕 Watchdog: crashed channels, secret changes, Yandex captcha, disk and RAM
+- 🐕 Watchdog: crashed channels, secret changes, Yandex captcha (Yandex transports only), a channel that stays disconnected from its document, disk and RAM
 - 🔄 OpenFlux updates without dropping channels or losing secrets
 - 💾 Backup and restore from the menu
 
@@ -68,9 +68,11 @@ Pick **"1. Установка"**, enter the bot token from [@BotFather](https://
 
 ## Bot commands
 
-**User:** `/start`, `/myconfig`, `/client`, `/delete` (delete your own channel or withdraw your request, with a confirmation button), or just send a document link.
+**User:** `/start`, `/myconfig`, `/client`, `/direct` (a channel without a document: plain TCP to the server; only when the admin set `PUBLIC_HOST`), `/delete` (delete your own channel or withdraw your request, with a confirmation button), or just send a document link.
 
-**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url> [secret|nosecret] [vyandex]`, `/delete [id]` (delete a channel after a button confirmation; the owner is notified), `/revoke <id>` (stop immediately), `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
+**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url|direct> [secret|nosecret] [vyandex]`, `/delete [id]` (delete a channel after a button confirmation; the owner is notified), `/revoke <id>` (stop immediately), `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
+
+**Supported links:** Yandex Docs (`https://disk.yandex.ru/i/…`), Yandex Boards (`https://boards.yandex.ru/guest/?hash=…`), Mail.ru (`https://cloud.mail.ru/public/…`). Yandex Volga (`vyandex`) is handed out by the admin: `/give <tg_id> <url> vyandex`.
 
 ## Clients
 

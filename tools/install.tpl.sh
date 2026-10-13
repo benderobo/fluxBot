@@ -228,6 +228,7 @@ configure() {
     echo "ARGS_YANDEX=$(env_or ARGS_YANDEX '--role=exit --transport=yandex --url {url}')"
     echo "ARGS_MAILRU=$(env_or ARGS_MAILRU '--role=exit --transport=mailru --url {url}')"
     echo "ARGS_VYANDEX=$(env_or ARGS_VYANDEX '--role=exit --transport=vyandex --url {url}')"
+    echo "ARGS_BOARDS=$(env_or ARGS_BOARDS '--role=exit --transport=boards --url {url}')"
     echo "CLIENT_LINKS=$(env_get CLIENT_LINKS)"
     local legacy; legacy=$(env_get SECRET_MODE)
     echo "SECRET_CHOICE=$(env_or SECRET_CHOICE "$([ "$legacy" = none ] && echo never || echo ask)")"
@@ -244,7 +245,12 @@ configure() {
     echo "TYPE_YANDEX=$(env_or TYPE_YANDEX yandex)"
     echo "TYPE_MAILRU=$(env_or TYPE_MAILRU mailru)"
     echo "TYPE_VYANDEX=$(env_or TYPE_VYANDEX vyandex)"
+    echo "TYPE_BOARDS=$(env_or TYPE_BOARDS boards)"
     echo "VYANDEX_MODE=$(env_or VYANDEX_MODE off)"
+    echo "PUBLIC_HOST=$(env_get PUBLIC_HOST)"
+    echo "DIRECT_PORT_MIN=$(env_or DIRECT_PORT_MIN 20000)"
+    echo "DIRECT_PORT_MAX=$(env_or DIRECT_PORT_MAX 20999)"
+    echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
   chmod 600 "$BOT_DIR/.env"
@@ -281,12 +287,14 @@ recreate_channels() {
     mapfile -t cmd < <(jq -r '.[0].Config.Cmd[]?' <<<"$j")
     mapfile -t lab < <(jq -r '.[0].Config.Labels // {} | to_entries[] | "--label=\(.key)=\(.value)"' <<<"$j")
     mapfile -t envs < <(jq -r '.[0].Config.Env[]? | select(startswith("OF_SECRET=")) | "--env=\(.)"' <<<"$j")
+    # опубликованные порты (прямые каналы) нужно сохранить при пересоздании
+    mapfile -t pubs < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $k | .value[]? | "--publish=\(.HostPort):\($k)"' <<<"$j")
     extra=()
     [ "$mem" -gt 0 ] && extra+=(--memory "$mem")
     [ "$cpu" -gt 0 ] && extra+=(--cpus "$(awk -v n="$cpu" 'BEGIN{printf "%.2f", n/1e9}')")
     docker rm -f "$id" >/dev/null
     if docker run -d --name "$name" --cap-add NET_ADMIN --cap-add NET_RAW --restart unless-stopped \
-        --log-opt max-size=10m --log-opt max-file=2 "${extra[@]}" "${lab[@]}" "${envs[@]}" "$IMAGE" "${cmd[@]}" >/dev/null; then
+        --log-opt max-size=10m --log-opt max-file=2 "${extra[@]}" "${lab[@]}" "${envs[@]}" "${pubs[@]}" "$IMAGE" "${cmd[@]}" >/dev/null; then
       ok "$name"
     else
       err "$name не поднялся — бот пометит его упавшим"
