@@ -227,6 +227,7 @@ configure() {
     echo "MEM_ALERT_PCT=$(env_or MEM_ALERT_PCT 90)"
     echo "ARGS_YANDEX=$(env_or ARGS_YANDEX '--role=exit --transport=yandex --url {url}')"
     echo "ARGS_MAILRU=$(env_or ARGS_MAILRU '--role=exit --transport=mailru --url {url}')"
+    echo "ARGS_VYANDEX=$(env_or ARGS_VYANDEX '--role=exit --transport=vyandex --url {url}')"
     echo "CLIENT_LINKS=$(env_get CLIENT_LINKS)"
     local legacy; legacy=$(env_get SECRET_MODE)
     echo "SECRET_CHOICE=$(env_or SECRET_CHOICE "$([ "$legacy" = none ] && echo never || echo ask)")"
@@ -242,6 +243,8 @@ configure() {
     echo "CONFIG_NAME=$(env_or CONFIG_NAME 'OpenFlux {id}')"
     echo "TYPE_YANDEX=$(env_or TYPE_YANDEX yandex)"
     echo "TYPE_MAILRU=$(env_or TYPE_MAILRU mailru)"
+    echo "TYPE_VYANDEX=$(env_or TYPE_VYANDEX vyandex)"
+    echo "VYANDEX_MODE=$(env_or VYANDEX_MODE off)"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
   chmod 600 "$BOT_DIR/.env"

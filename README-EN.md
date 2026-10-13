@@ -70,7 +70,7 @@ Pick **"1. Установка"**, enter the bot token from [@BotFather](https://
 
 **User:** `/start`, `/myconfig`, `/client`, or just send a document link.
 
-**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url> [secret|nosecret]`, `/revoke <id>`, `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
+**Admin:** `/users`, `/channels`, `/status`, `/give <tg_id> <url> [secret|nosecret] [vyandex]`, `/revoke <id>`, `/ban` · `/unban <tg_id>`, `/decode <openflux://v1/...>`.
 
 ## Clients
 
@@ -82,7 +82,7 @@ Pick **"1. Установка"**, enter the bot token from [@BotFather](https://
 
 ## Configuration
 
-`/opt/openflux-bot/bot/.env`, apply with `ofbot restart`. All options are documented in [`bot/.env.example`](./bot/.env.example).
+`/opt/openflux-bot/bot/.env`, apply with `ofbot restart`. All options are documented in [`bot/.env.example`](./bot/.env.example). Yandex Volga (`vyandex`, links like `https://docs.yandex.ru/edit/d/…`) is handed out with `/give <tg_id> <url> vyandex`; set `VYANDEX_MODE=auto` to route such links from users to it automatically.
 
 ## Encryption
 

@@ -131,7 +131,7 @@ OPENFLUX BOT  v1.6.1
 | `/users` | Список пользователей и их статусы |
 | `/channels` | Активные каналы и занятые слоты |
 | `/status` | Диск, RAM, нагрузка сервера |
-| `/give <tg_id> <url> [secret\|nosecret]` | Выдать канал вручную |
+| `/give <tg_id> <url> [secret\|nosecret] [vyandex]` | Выдать канал вручную. `vyandex` — через Yandex Volga, ссылка вида `https://docs.yandex.ru/edit/d/…` |
 | `/revoke <id>` | Остановить канал |
 | `/ban <tg_id>` · `/unban <tg_id>` | Бан с остановкой всех каналов |
 | `/decode <openflux://v1/...>` | Показать JSON любого профиля |
@@ -165,6 +165,7 @@ OPENFLUX BOT  v1.6.1
 | `CONFIG_FORMAT` | `openflux-v1` | Формат профиля: `openflux-v1` или `template` |
 | `CONFIG_NAME` | `OpenFlux {id}` | Имя профиля в клиенте |
 | `QR_ENABLED` | `1` | Слать профиль ещё и QR-кодом |
+| `VYANDEX_MODE` | `off` | `off` — транспорт `vyandex` только через `/give … vyandex`; `auto` — ссылки `https://docs.yandex.ru/edit/d/…` от пользователей сразу идут в `vyandex` |
 | `CLIENT_LINKS` | p1neappleXpress | Кнопки клиентов: `Название\|url;Название\|url` |
 | `DISK_ALERT_PCT` / `MEM_ALERT_PCT` | `85` / `90` | Пороги алертов админу |
 
