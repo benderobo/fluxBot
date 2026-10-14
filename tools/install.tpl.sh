@@ -253,6 +253,7 @@ configure() {
     echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
     echo "CUPS_ENABLED=$(env_or CUPS_ENABLED 1)"
     echo "CUPS_TIMEOUT=$(env_or CUPS_TIMEOUT 90)"
+    echo "CUPS_STRIPE=$(env_get CUPS_STRIPE)"
     echo "TYPE_CUPS=$(env_or TYPE_CUPS cupsonline)"
     echo "ARGS_CUPS=$(env_or ARGS_CUPS '--role=exit --transport=cupsonline')"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
@@ -290,7 +291,7 @@ recreate_channels() {
     cpu=$(jq -r '.[0].HostConfig.NanoCpus // 0' <<<"$j")
     mapfile -t cmd < <(jq -r '.[0].Config.Cmd[]?' <<<"$j")
     mapfile -t lab < <(jq -r '.[0].Config.Labels // {} | to_entries[] | "--label=\(.key)=\(.value)"' <<<"$j")
-    mapfile -t envs < <(jq -r '.[0].Config.Env[]? | select(startswith("OF_SECRET=")) | "--env=\(.)"' <<<"$j")
+    mapfile -t envs < <(jq -r '.[0].Config.Env[]? | select(startswith("OF_SECRET=") or startswith("CUPS_STRIPE=")) | "--env=\(.)"' <<<"$j")
     # опубликованные порты (прямые каналы) нужно сохранить при пересоздании
     mapfile -t pubs < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $k | .value[]? | "--publish=\(.HostPort):\($k)"' <<<"$j")
     extra=()

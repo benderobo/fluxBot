@@ -138,6 +138,9 @@ DIRECT_PRIORITY = 50  # как directPriority в OpenFlux
 # (список комнат в контекст не входит, см. transport/kdfcontext.go в OpenFlux).
 CUPS_ENABLED = (os.getenv("CUPS_ENABLED") or "1") == "1"
 CUPS_TIMEOUT = int(os.getenv("CUPS_TIMEOUT") or "90")  # сколько ждать список комнат в логе узла
+# OpenFlux 0.7.1+ создаёт комнаты в новом формате ({"v":2,...}) и говорит по новому протоколу; клиент старее 0.7.1 такой список
+# не читает ("--url must contain base64 room list"). CUPS_STRIPE=0 просит узел работать по-старому — для таких клиентов.
+CUPS_STRIPE = (os.getenv("CUPS_STRIPE") or "").strip()
 # каналы без ссылки на документ: ключ обязателен и передаётся через OF_SECRET, а не из лога
 NO_DOC_TRANSPORTS = ("direct", "cups")
 # Секрет канала
@@ -617,6 +620,8 @@ def _run_container(ch, secret=None):
             args += [t.format(**fmt) for t in shlex.split(SECRET_ARG)]
         else:
             env["OF_SECRET"] = secret  # entrypoint → файл → --encryption-key-file
+    if ch["transport"] == "cups" and CUPS_STRIPE == "0":
+        env["CUPS_STRIPE"] = "0"  # старый формат списка комнат и протокола, для клиентов старее 0.7.1
     dk.containers.run(
         OF_IMAGE,
         command=args,
@@ -1704,6 +1709,7 @@ configure() {
     echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
     echo "CUPS_ENABLED=$(env_or CUPS_ENABLED 1)"
     echo "CUPS_TIMEOUT=$(env_or CUPS_TIMEOUT 90)"
+    echo "CUPS_STRIPE=$(env_get CUPS_STRIPE)"
     echo "TYPE_CUPS=$(env_or TYPE_CUPS cupsonline)"
     echo "ARGS_CUPS=$(env_or ARGS_CUPS '--role=exit --transport=cupsonline')"
     echo "CONFIG_TEMPLATE=$(env_or CONFIG_TEMPLATE 'openflux://?transport={transport}&url={url_enc}&name={name}')"
@@ -1741,7 +1747,7 @@ recreate_channels() {
     cpu=$(jq -r '.[0].HostConfig.NanoCpus // 0' <<<"$j")
     mapfile -t cmd < <(jq -r '.[0].Config.Cmd[]?' <<<"$j")
     mapfile -t lab < <(jq -r '.[0].Config.Labels // {} | to_entries[] | "--label=\(.key)=\(.value)"' <<<"$j")
-    mapfile -t envs < <(jq -r '.[0].Config.Env[]? | select(startswith("OF_SECRET=")) | "--env=\(.)"' <<<"$j")
+    mapfile -t envs < <(jq -r '.[0].Config.Env[]? | select(startswith("OF_SECRET=") or startswith("CUPS_STRIPE=")) | "--env=\(.)"' <<<"$j")
     # опубликованные порты (прямые каналы) нужно сохранить при пересоздании
     mapfile -t pubs < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[] | .key as $k | .value[]? | "--publish=\(.HostPort):\($k)"' <<<"$j")
     extra=()
