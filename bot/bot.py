@@ -457,14 +457,23 @@ def find_secret(logs):
 CUPS_ROOMS_RE = re.compile(r"=== COPY THIS TO CLIENT ===\s*\r?\n\s*([A-Za-z0-9_-]{8,4096})\s*\r?\n\s*=+")
 
 
+def _cups_room_ids(payload):
+    """Комнаты из раскодированного JSON: старый формат — список uuid, новый (v2) — {"v":2,"rooms":[uuid,...]}."""
+    ids = payload.get("rooms") if isinstance(payload, dict) else payload
+    if isinstance(ids, list) and ids and all(isinstance(i, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", i) for i in ids):
+        return ids
+    return None
+
+
 def find_cups_rooms(logs):
-    """Последний напечатанный узлом список комнат или None. Проверяет, что внутри JSON-список uuid."""
+    """Последний напечатанный узлом список комнат (строка base64url как есть) или None.
+    Узел печатает его в формате своей версии, поэтому понимаем оба: список uuid и объект {"v":2,"rooms":[...]}."""
     for packed in reversed(CUPS_ROOMS_RE.findall(logs or "")):
         try:
-            ids = json.loads(base64.urlsafe_b64decode(packed + "=" * (-len(packed) % 4)))
+            payload = json.loads(base64.urlsafe_b64decode(packed + "=" * (-len(packed) % 4)))
         except Exception:
             continue
-        if isinstance(ids, list) and ids and all(isinstance(i, str) and re.fullmatch(r"[0-9a-fA-F-]{36}", i) for i in ids):
+        if _cups_room_ids(payload):
             return packed
     return None
 
