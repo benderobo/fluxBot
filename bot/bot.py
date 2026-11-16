@@ -607,6 +607,10 @@ CAPTCHA_MARKERS = ("captcha required", "captcha solve:", "login required")
 YANDEX_TRANSPORTS = {"yandex", "vyandex", "boards"}
 # Признаки того, что узел не подключён к документу (строки уровня Info, видны без отладки)
 NO_CARRIER_MARKERS = ("no carrier is connected", "cannot open the document")
+# Ошибки, после которых документный транспорт заведомо не сможет заработать без
+# изменения ссылки, прав доступа или внешнего API. Контейнер при этом продолжает
+# работать и раньше ошибочно выдавался пользователю как готовый канал.
+FATAL_CARRIER_MARKERS = ("api returned status 401",)
 CARRIER_ALERT_TICKS = 2  # столько проверок подряд (по минуте), прежде чем предупреждать админа
 CARRIER_CLEAR_TICKS = 2
 
@@ -617,6 +621,10 @@ def has_captcha(transport, logs):
 
 def carrier_down(logs):
     return any(mk in (logs or "").lower() for mk in NO_CARRIER_MARKERS)
+
+
+def carrier_fatal(logs):
+    return any(mk in (logs or "").lower() for mk in FATAL_CARRIER_MARKERS)
 
 
 def carrier_detail(logs):
@@ -671,6 +679,23 @@ def _remove_container(name):
         dk.containers.get(name).remove(force=True)
     except docker.errors.NotFound:
         pass
+
+
+async def fail_fatal_carrier(bot, ch, logs):
+    """Остановить внешне живой контейнер, транспорт которого получил фатальный отказ API."""
+    await asyncio.to_thread(_remove_container, ch["container"])
+    set_channel(ch["id"], "failed")
+    detail = carrier_detail(logs) or "API документа отклонил подключение"
+    await notify_user(
+        bot, ch["tg_id"],
+        "Документный канал не подключился: сервис отклонил доступ. "
+        "Проверь права по ссылке или используй /direct.",
+    )
+    await notify_admins(
+        bot,
+        f"❌ Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}) отклонён API документа.\n"
+        f"<pre>{esc(detail)}</pre>",
+    )
 
 
 def allocate_port(ch_id):
@@ -761,6 +786,12 @@ async def provision(bot: Bot, ch_id):
                     f"<pre>{esc(logs[-1500:])}</pre>",
                 )
                 return
+
+        if status == "running" and ch["transport"] not in NO_DOC_TRANSPORTS and carrier_fatal(logs):
+            ch = dict(ch)
+            ch["container"] = name
+            await fail_fatal_carrier(bot, ch, logs)
+            return
 
         if status != "running":
             await asyncio.to_thread(_remove_container, name)
@@ -889,6 +920,9 @@ async def watchdog(bot: Bot):
 
                 recent = await asyncio.to_thread(_recent_logs, ch["container"])
                 last_minute = await asyncio.to_thread(_recent_logs, ch["container"], 60)
+                if ch["transport"] not in NO_DOC_TRANSPORTS and carrier_fatal(recent):
+                    await fail_fatal_carrier(bot, ch, recent)
+                    continue
                 await check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier)
                 if started_at and started_at != ch["started_at"]:
                     await refresh_after_restart(bot, ch, logs, started_at)

@@ -3,7 +3,7 @@
 # Запуск: bash <(curl -Ls https://raw.githubusercontent.com/benderobo/fluxBot/main/install.sh)
 # После установки: ofbot
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 SCRIPT_URL="${OFBOT_SCRIPT_URL:-https://raw.githubusercontent.com/benderobo/fluxBot/main/install.sh}"
 BASE=/opt/openflux-bot
 BOT_DIR=$BASE/bot
@@ -687,6 +687,10 @@ CAPTCHA_MARKERS = ("captcha required", "captcha solve:", "login required")
 YANDEX_TRANSPORTS = {"yandex", "vyandex", "boards"}
 # Признаки того, что узел не подключён к документу (строки уровня Info, видны без отладки)
 NO_CARRIER_MARKERS = ("no carrier is connected", "cannot open the document")
+# Ошибки, после которых документный транспорт заведомо не сможет заработать без
+# изменения ссылки, прав доступа или внешнего API. Контейнер при этом продолжает
+# работать и раньше ошибочно выдавался пользователю как готовый канал.
+FATAL_CARRIER_MARKERS = ("api returned status 401",)
 CARRIER_ALERT_TICKS = 2  # столько проверок подряд (по минуте), прежде чем предупреждать админа
 CARRIER_CLEAR_TICKS = 2
 
@@ -697,6 +701,10 @@ def has_captcha(transport, logs):
 
 def carrier_down(logs):
     return any(mk in (logs or "").lower() for mk in NO_CARRIER_MARKERS)
+
+
+def carrier_fatal(logs):
+    return any(mk in (logs or "").lower() for mk in FATAL_CARRIER_MARKERS)
 
 
 def carrier_detail(logs):
@@ -751,6 +759,23 @@ def _remove_container(name):
         dk.containers.get(name).remove(force=True)
     except docker.errors.NotFound:
         pass
+
+
+async def fail_fatal_carrier(bot, ch, logs):
+    """Остановить внешне живой контейнер, транспорт которого получил фатальный отказ API."""
+    await asyncio.to_thread(_remove_container, ch["container"])
+    set_channel(ch["id"], "failed")
+    detail = carrier_detail(logs) or "API документа отклонил подключение"
+    await notify_user(
+        bot, ch["tg_id"],
+        "Документный канал не подключился: сервис отклонил доступ. "
+        "Проверь права по ссылке или используй /direct.",
+    )
+    await notify_admins(
+        bot,
+        f"❌ Канал #{ch['id']} ({ch['tg_id']}, {ch['transport']}) отклонён API документа.\n"
+        f"<pre>{esc(detail)}</pre>",
+    )
 
 
 def allocate_port(ch_id):
@@ -841,6 +866,12 @@ async def provision(bot: Bot, ch_id):
                     f"<pre>{esc(logs[-1500:])}</pre>",
                 )
                 return
+
+        if status == "running" and ch["transport"] not in NO_DOC_TRANSPORTS and carrier_fatal(logs):
+            ch = dict(ch)
+            ch["container"] = name
+            await fail_fatal_carrier(bot, ch, logs)
+            return
 
         if status != "running":
             await asyncio.to_thread(_remove_container, name)
@@ -969,6 +1000,9 @@ async def watchdog(bot: Bot):
 
                 recent = await asyncio.to_thread(_recent_logs, ch["container"])
                 last_minute = await asyncio.to_thread(_recent_logs, ch["container"], 60)
+                if ch["transport"] not in NO_DOC_TRANSPORTS and carrier_fatal(recent):
+                    await fail_fatal_carrier(bot, ch, recent)
+                    continue
                 await check_channel_logs(bot, ch, recent, last_minute, captcha_alerted, carrier)
                 if started_at and started_at != ch["started_at"]:
                     await refresh_after_restart(bot, ch, logs, started_at)
@@ -1655,7 +1689,7 @@ build_exit_image() {
 
 # ---------------- настройка ----------------
 configure() {
-  local token bot_name admins ram def maxch
+  local token bot_name admins ram def maxch public_host detected_host direct_min direct_max
   while :; do
     token=$(ask "BOT_TOKEN (от @BotFather)" "$(env_get BOT_TOKEN)")
     bot_name=$(curl -fsS "https://api.telegram.org/bot${token}/getMe" 2>/dev/null | jq -r '.result.username // empty')
@@ -1670,6 +1704,16 @@ configure() {
   ram=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   def=$(( (ram - 512) / 150 )); [ "$def" -lt 1 ] && def=1
   maxch=$(ask "MAX_CHANNELS (RAM ${ram} МБ → рекомендую $def)" "$(env_or MAX_CHANNELS "$def")")
+  detected_host=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  public_host=$(env_get PUBLIC_HOST)
+  if [ -n "$public_host" ]; then
+    public_host=$(ask "PUBLIC_HOST для /direct ('off' — выключить)" "$public_host")
+    [ "$public_host" = off ] && public_host=""
+  elif confirm "Включить резервный зашифрованный /direct?"; then
+    public_host=$(ask "PUBLIC_HOST для /direct (IP или домен)" "$detected_host")
+  fi
+  direct_min=$(env_or DIRECT_PORT_MIN 20000)
+  direct_max=$(env_or DIRECT_PORT_MAX 20999)
 
   {
     echo "BOT_TOKEN=$token"
@@ -1703,9 +1747,9 @@ configure() {
     echo "TYPE_VYANDEX=$(env_or TYPE_VYANDEX vyandex)"
     echo "TYPE_BOARDS=$(env_or TYPE_BOARDS boards)"
     echo "VYANDEX_MODE=$(env_or VYANDEX_MODE off)"
-    echo "PUBLIC_HOST=$(env_get PUBLIC_HOST)"
-    echo "DIRECT_PORT_MIN=$(env_or DIRECT_PORT_MIN 20000)"
-    echo "DIRECT_PORT_MAX=$(env_or DIRECT_PORT_MAX 20999)"
+    echo "PUBLIC_HOST=$public_host"
+    echo "DIRECT_PORT_MIN=$direct_min"
+    echo "DIRECT_PORT_MAX=$direct_max"
     echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
     echo "CUPS_ENABLED=$(env_or CUPS_ENABLED 1)"
     echo "CUPS_TIMEOUT=$(env_or CUPS_TIMEOUT 90)"
@@ -1716,6 +1760,14 @@ configure() {
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
   chmod 600 "$BOT_DIR/.env"
   ok "Настройки сохранены в $BOT_DIR/.env"
+  if [ -n "$public_host" ]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw allow "${direct_min}:${direct_max}/tcp" comment 'OpenFlux direct channels' >/dev/null
+      ok "UFW: открыт TCP ${direct_min}:${direct_max} для /direct"
+    else
+      warn "Открой TCP ${direct_min}:${direct_max} во внешнем firewall для /direct"
+    fi
+  fi
 }
 
 bot_up()      { (cd "$BOT_DIR" && docker compose up -d --build) && ok "Бот запущен"; docker image prune -f >/dev/null 2>&1; }

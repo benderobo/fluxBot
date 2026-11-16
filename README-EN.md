@@ -55,7 +55,7 @@ Every channel is a separate container with its own network namespace, RAM/CPU li
 bash <(curl -Ls https://raw.githubusercontent.com/benderobo/fluxBot/main/install.sh)
 ```
 
-Pick **"1. Установка"**, enter the bot token from [@BotFather](https://t.me/BotFather), your Telegram ID from [@userinfobot](https://t.me/userinfobot) and the channel limit. Then send `/start` to your bot. Menu afterwards: `ofbot`.
+Pick **"1. Установка"**, enter the bot token from [@BotFather](https://t.me/BotFather), your Telegram ID from [@userinfobot](https://t.me/userinfobot), the channel limit and choose whether to enable the `/direct` fallback. If enabled, confirm its public IP/domain. Then send `/start` to your bot. Menu afterwards: `ofbot`.
 
 | Channels | vCPU | RAM | Disk |
 |---|---|---|---|
@@ -97,7 +97,7 @@ For 🔑 channels the bot generates a secret and passes it via an environment va
 > [!IMPORTANT]
 > The bot has access to `docker.sock`, which is root-equivalent. Treat the bot token like a root password.
 
-Use SSH keys only, install `fail2ban`, expose nothing but SSH on the exit server.
+Use SSH keys only and install `fail2ban`. When `/direct` is enabled, its configured TCP port range must also be exposed; the installer adds the rule automatically when UFW is active.
 
 ## Development
 

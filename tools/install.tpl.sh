@@ -3,7 +3,7 @@
 # Запуск: bash <(curl -Ls https://raw.githubusercontent.com/benderobo/fluxBot/main/install.sh)
 # После установки: ofbot
 
-VERSION="1.6.1"
+VERSION="1.6.2"
 SCRIPT_URL="${OFBOT_SCRIPT_URL:-https://raw.githubusercontent.com/benderobo/fluxBot/main/install.sh}"
 BASE=/opt/openflux-bot
 BOT_DIR=$BASE/bot
@@ -199,7 +199,7 @@ build_exit_image() {
 
 # ---------------- настройка ----------------
 configure() {
-  local token bot_name admins ram def maxch
+  local token bot_name admins ram def maxch public_host detected_host direct_min direct_max
   while :; do
     token=$(ask "BOT_TOKEN (от @BotFather)" "$(env_get BOT_TOKEN)")
     bot_name=$(curl -fsS "https://api.telegram.org/bot${token}/getMe" 2>/dev/null | jq -r '.result.username // empty')
@@ -214,6 +214,16 @@ configure() {
   ram=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
   def=$(( (ram - 512) / 150 )); [ "$def" -lt 1 ] && def=1
   maxch=$(ask "MAX_CHANNELS (RAM ${ram} МБ → рекомендую $def)" "$(env_or MAX_CHANNELS "$def")")
+  detected_host=$(curl -4fsS --max-time 5 https://api.ipify.org 2>/dev/null || true)
+  public_host=$(env_get PUBLIC_HOST)
+  if [ -n "$public_host" ]; then
+    public_host=$(ask "PUBLIC_HOST для /direct ('off' — выключить)" "$public_host")
+    [ "$public_host" = off ] && public_host=""
+  elif confirm "Включить резервный зашифрованный /direct?"; then
+    public_host=$(ask "PUBLIC_HOST для /direct (IP или домен)" "$detected_host")
+  fi
+  direct_min=$(env_or DIRECT_PORT_MIN 20000)
+  direct_max=$(env_or DIRECT_PORT_MAX 20999)
 
   {
     echo "BOT_TOKEN=$token"
@@ -247,9 +257,9 @@ configure() {
     echo "TYPE_VYANDEX=$(env_or TYPE_VYANDEX vyandex)"
     echo "TYPE_BOARDS=$(env_or TYPE_BOARDS boards)"
     echo "VYANDEX_MODE=$(env_or VYANDEX_MODE off)"
-    echo "PUBLIC_HOST=$(env_get PUBLIC_HOST)"
-    echo "DIRECT_PORT_MIN=$(env_or DIRECT_PORT_MIN 20000)"
-    echo "DIRECT_PORT_MAX=$(env_or DIRECT_PORT_MAX 20999)"
+    echo "PUBLIC_HOST=$public_host"
+    echo "DIRECT_PORT_MIN=$direct_min"
+    echo "DIRECT_PORT_MAX=$direct_max"
     echo "ARGS_DIRECT=$(env_or ARGS_DIRECT '--role=exit --negotiate --transports=direct:50 --direct-listen=0.0.0.0:{port}')"
     echo "CUPS_ENABLED=$(env_or CUPS_ENABLED 1)"
     echo "CUPS_TIMEOUT=$(env_or CUPS_TIMEOUT 90)"
@@ -260,6 +270,14 @@ configure() {
   } > "$BOT_DIR/.env.new" && mv "$BOT_DIR/.env.new" "$BOT_DIR/.env"
   chmod 600 "$BOT_DIR/.env"
   ok "Настройки сохранены в $BOT_DIR/.env"
+  if [ -n "$public_host" ]; then
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q '^Status: active'; then
+      ufw allow "${direct_min}:${direct_max}/tcp" comment 'OpenFlux direct channels' >/dev/null
+      ok "UFW: открыт TCP ${direct_min}:${direct_max} для /direct"
+    else
+      warn "Открой TCP ${direct_min}:${direct_max} во внешнем firewall для /direct"
+    fi
+  fi
 }
 
 bot_up()      { (cd "$BOT_DIR" && docker compose up -d --build) && ok "Бот запущен"; docker image prune -f >/dev/null 2>&1; }
